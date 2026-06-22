@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp
+
+# WASM cache
+.wasm-cache/
+
+# Models (too large to commit)
+public/models/
+public/*.wasm.js
+public/*.wasm.wasm
+
+# Sub-projects (not part of core)
+unity-project/
+vrm-tool/
+
+# Docs
+*.md
+!package.json
+
+# Package locks
+package-lock.json

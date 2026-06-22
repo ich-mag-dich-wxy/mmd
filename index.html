@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MMD Viewer</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="scene-container"></div>
+
+  <div id="loading-overlay">
+    <div class="loading-spinner"></div>
+    <div id="loading-text">初始化中...</div>
+  </div>
+
+  <div class="header">
+    <h1>MMD Viewer</h1>
+    <span class="subtitle">加载 MMD 模型，播放 VMD 动作，反编译/编译 VMD</span>
+  </div>
+
+  <div class="info-panel">
+    <div class="info-row">
+      <span class="info-label">模型:</span>
+      <span class="info-value" id="info-model">未加载</span>
+    </div>
+    <div class="info-row">
+      <span class="info-label">动作:</span>
+      <span class="info-value" id="info-motion">无</span>
+    </div>
+  </div>
+
+  <div class="upload-panel" id="drop-zone">
+    <h3>加载模型</h3>
+    <p class="hint">拖拽文件夹到此处，或点击下方按钮</p>
+
+    <div class="file-group folder-group">
+      <label class="file-btn folder-btn">
+        📂 选择模型文件夹
+        <input type="file" class="file-input-folder" webkitdirectory multiple hidden />
+      </label>
+      <span class="file-name" id="file-folder-name">包含 PMX/PMD + 贴图</span>
+    </div>
+
+    <div class="divider"><span>VMD 动作文件</span></div>
+
+    <div class="file-group">
+      <label class="file-btn motion-btn">
+        💃 选择 VMD 文件
+        <input type="file" class="file-input" data-type="motion" accept=".vmd" hidden />
+      </label>
+      <span class="file-name" id="file-motion-name">未选择</span>
+    </div>
+  </div>
+
+  <div class="editor-panel">
+    <div class="editor-header">
+      <span>VMD 反编译 / 编译</span>
+    </div>
+    <div class="editor-body">
+      <div class="editor-section">
+        <h4>反编译 (VMD → 文本)</h4>
+        <p class="hint">将已上传的 VMD 反编译为文本文件并下载</p>
+        <button class="editor-btn decompile-btn" id="btn-decompile">🔄 反编译并下载</button>
+      </div>
+      <div class="editor-section">
+        <h4>编译并播放 (文本 → VMD)</h4>
+        <p class="hint">上传反编译的文本文件，编译为 VMD 并播放</p>
+        <div class="file-group">
+          <label class="file-btn compile-upload-btn">
+            📄 选择文本文件
+            <input type="file" id="mpl-file-input" accept=".txt,.mpl" hidden />
+          </label>
+          <span class="file-name" id="mpl-file-name">未选择</span>
+        </div>
+        <button class="editor-btn compile-btn" id="btn-compile">▶ 编译并播放</button>
+      </div>
+    </div>
+    <div class="editor-progress" id="editor-progress">
+      <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+      <span class="progress-text" id="progress-text"></span>
+    </div>
+    <div class="editor-status" id="editor-status">就绪</div>
+  </div>
+
+  <div class="controls-bar">
+    <button class="control-btn" id="btn-play" title="播放/暂停">⏯️</button>
+    <button class="control-btn" id="btn-reset-camera" title="重置视角">📷</button>
+    <div class="speed-control">
+      <label>速度:</label>
+      <input type="range" id="speed-slider" min="0.1" max="3" step="0.1" value="1" />
+      <span id="speed-label">1.0x</span>
+    </div>
+  </div>
+
+  <div class="footer-hint">
+    💡 鼠标左键旋转 | 右键平移 | 滚轮缩放
+  </div>
+
+  <script src="/ammo.wasm.js"></script>
+  <script type="module" src="/main.js"></script>
+</body>
+</html>
