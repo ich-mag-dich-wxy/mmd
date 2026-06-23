@@ -1,6 +1,4 @@
 import * as THREE from 'three';
-import { createAnimationClip, initMPL } from './mplPipeline.js';
-import { matchBones, saveOverride, clearOverrides, getOverrides, SEMANTIC_BONE_LIST } from './boneMatcher.js';
 import { lerpCriticalDamped } from '../utils/spring.js';
 
 export class AvatarCore {
@@ -9,7 +7,6 @@ export class AvatarCore {
     this.helper = opts.helper || null;
     this.isSpeaking = false;
 
-    this._mplReady = false;
     this.userWorldPos = new THREE.Vector3(0, 1.6, 2.5);
     this._animClip = null;
     this._animTime = 0;
@@ -53,37 +50,8 @@ export class AvatarCore {
     if (!mesh.bindMatrix) mesh.bindMatrix = new THREE.Matrix4().identity();
     if (!mesh.bindMatrixInverse) mesh.bindMatrixInverse = new THREE.Matrix4().identity();
 
-    this._boneNameMap = {};
-    this._allBoneNames = bones.map(b => b.name);
-    this._boneMatchReady = false;
-
-    console.log('[AvatarCore] 启动骨骼匹配...');
-    (async () => {
-      try {
-        const result = await matchBones(bones, { debug: true });
-        this._boneNameMap = result.map;
-        this._allBoneNames = result.allNames;
-        this._smartBoneMap = {};
-        for (const [semantic, name] of Object.entries(this._boneNameMap)) {
-          const idx = bones.findIndex(b => b.name === name);
-          if (idx >= 0) this._smartBoneMap[semantic] = idx;
-        }
-        this._boneMatchReady = true;
-        console.log('[AvatarCore] 骨骼匹配完成:', Object.keys(this._boneNameMap).length + '/' + SEMANTIC_BONE_LIST.length);
-      } catch (err) {
-        console.error('[AvatarCore] 骨骼匹配失败:', err);
-      }
-    })();
-
     mesh.frustumCulled = false;
     this._findHeadBone(bones);
-
-    initMPL().then(() => {
-      this._mplReady = true;
-      console.log('[AvatarCore] MPL 就绪');
-    }).catch(err => {
-      console.error('[AvatarCore] MPL 初始化失败:', err);
-    });
   }
 
   _findHeadBone(bones) {
@@ -94,41 +62,6 @@ export class AvatarCore {
         this._headInitQuat = bone.quaternion.clone();
         return;
       }
-    }
-  }
-
-  getBoneMatchReport() {
-    const result = {};
-    const map = this._boneNameMap || {};
-    for (const semantic of SEMANTIC_BONE_LIST) {
-      result[semantic] = map[semantic] || null;
-    }
-    return { matched: result, allBoneNames: this._allBoneNames || [], overrides: getOverrides(), ready: this._boneMatchReady };
-  }
-
-  setBoneMapping(semantic, actualBoneName) {
-    if (!SEMANTIC_BONE_LIST.includes(semantic)) return false;
-    if (actualBoneName && !this._allBoneNames.includes(actualBoneName)) return false;
-    if (actualBoneName) {
-      this._boneNameMap[semantic] = actualBoneName;
-      saveOverride(semantic, actualBoneName);
-    } else {
-      delete this._boneNameMap[semantic];
-      const all = getOverrides();
-      delete all[semantic];
-      try { localStorage.setItem('mmd_bone_overrides', JSON.stringify(all)); } catch(e) {}
-    }
-    return true;
-  }
-
-  async resetBoneMappings() {
-    clearOverrides();
-    try {
-      const matchResult = await matchBones(this.mesh.skeleton.bones, { debug: true });
-      this._boneNameMap = matchResult.map;
-      this._allBoneNames = matchResult.allNames;
-    } catch (err) {
-      console.error('[AvatarCore] 重置骨骼映射失败:', err);
     }
   }
 
@@ -151,28 +84,11 @@ export class AvatarCore {
     }
   }
 
-  playMPL(mplScript) {
-    if (!this._mplReady) {
-      setTimeout(() => this.playMPL(mplScript), 100);
-      return;
-    }
-    if (!this._boneMatchReady) {
-      setTimeout(() => this.playMPL(mplScript), 100);
-      return;
-    }
-
+  playClip(clip) {
     this.stopAllAnimations();
-    this._playManual(mplScript);
-  }
-
-  _playManual(mplScript) {
-    try {
-      const clip = createAnimationClip(this.mesh, mplScript, this._boneNameMap, this._smartBoneMap);
-      this._animClip = clip;
-      this._animTime = 0;
-    } catch (err) {
-      console.error('[AvatarCore] 手动播放失败:', err);
-    }
+    this._animClip = clip;
+    this._animTime = 0;
+    this._vmdModePureJS = true;
   }
 
   update(dt) {
@@ -182,7 +98,6 @@ export class AvatarCore {
       this._animTime += dt;
       this._applyBoneAnimation(this._animClip, this._animTime);
     } else if (this._animClip && this._animTime >= this._animClip.duration) {
-      // Pure-JS VMD 模式下循环播放，否则复位到 rest
       if (this._vmdModePureJS) {
         this._animTime = this._animTime % this._animClip.duration;
         this._applyBoneAnimation(this._animClip, this._animTime);
@@ -199,7 +114,6 @@ export class AvatarCore {
       this._applyHeadLookAt(dt);
     }
 
-    // Pure-JS VMD 模式下跳过自动 morph（避免覆盖 VMD 表情数据）
     if (!this._vmdModePureJS) {
       this._applyMorphTargets(dt);
     }
@@ -208,7 +122,7 @@ export class AvatarCore {
   _applyBoneAnimation(clip, time) {
     this._activeBoneIndices.clear();
     const skeleton = this.mesh.skeleton;
-    const POS_THRESHOLD = 1e-6; // 位置偏移阈值，小于此值视为 0
+    const POS_THRESHOLD = 1e-6;
 
     for (const track of clip.tracks) {
       const bone = skeleton.bones[track.boneIdx];
@@ -216,12 +130,9 @@ export class AvatarCore {
 
       const kf = sampleKeyframes(track.keyframes, time);
 
-      // 四元数：直接设置（文本中已是右手坐标系）
       kf.quat.normalize();
       bone.quaternion.copy(kf.quat);
 
-      // 位置：basePosition + vmdPosition（与 MMDLoader 一致）
-      // 只在位置偏移显著时才应用，避免浮点噪声导致抖动
       if (kf.pos) {
         const restPos = this._boneRestPos[track.boneIdx];
         if (restPos) {
@@ -234,7 +145,6 @@ export class AvatarCore {
               restPos.z + kf.pos.z,
             );
           } else {
-            // 偏移为零，恢复到 rest position
             bone.position.copy(restPos);
           }
         }
@@ -253,17 +163,16 @@ export class AvatarCore {
       skeleton.computeBoneTexture();
     }
 
-    // 应用 morph 轨道（Pure-JS VMD 模式）
-    if (clip.morphTracks && clip.morphTracks.length > 0 && this.mesh.morphTargetDictionary) {
+    if (clip.morphTracks && clip.morphTracks.length > 0 && this.mesh.morphTargetInfluences) {
       const dict = this.mesh.morphTargetDictionary;
       const influences = this.mesh.morphTargetInfluences;
-      if (influences) {
-        for (const mt of clip.morphTracks) {
-          const idx = dict[mt.morphName];
-          if (idx === undefined) continue;
-          const w = lerpMorphKeyframes(mt.keyframes, time);
-          influences[idx] = w;
-        }
+      for (const mt of clip.morphTracks) {
+        // 优先使用预解析的 morphIdx，否则查 morphTargetDictionary
+        let idx = mt.morphIdx;
+        if (idx === undefined && dict) idx = dict[mt.morphName];
+        if (idx === undefined) continue;
+        const w = lerpMorphKeyframes(mt.keyframes, time);
+        influences[idx] = w;
       }
     }
   }
@@ -364,7 +273,6 @@ function lerpKeyframes(kfs, t) {
   return result;
 }
 
-// 同时插值位置和四元数（Pure-JS VMD 播放用）
 function sampleKeyframes(kfs, t) {
   if (kfs.length === 1) return kfs[0];
   if (t <= kfs[0].time) return kfs[0];

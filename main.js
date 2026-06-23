@@ -3,7 +3,6 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { MMDLoader } from 'three/addons/loaders/MMDLoader.js';
 import { MMDAnimationHelper } from 'three/addons/animation/MMDAnimationHelper.js';
 import { createAvatar } from './src/core/avatarCore.js';
-import { initMPLCompiler } from './src/core/mplWasmCompiler.js';
 import { vmdToText, textToVMD, createDirectAnimationClip, downloadVMD } from './src/core/vmdDecompiler.js';
 
 const state = {
@@ -210,7 +209,6 @@ async function loadMMD() {
 
     await new Promise((r) => setTimeout(r, 100));
     if (state.mesh.skeleton && state.mesh.skeleton.bones) {
-      await initMPLCompiler();
       const vmdMode = !!state.animation;
       state.avatar = createAvatar(state.mesh, { scene, helper: state.helper, vmdMode });
     }
@@ -499,7 +497,7 @@ $('#btn-compile').addEventListener('click', async () => {
     // MMDLoader 失败，回退到 Pure-JS 直接播放
     console.warn('[Compile] MMDLoader 播放失败，回退到 Pure-JS:', err);
     try {
-      const clip = createDirectAnimationClip(text, state.mesh.skeleton);
+      const clip = createDirectAnimationClip(text, state.mesh.skeleton, state.mesh.morphTargetDictionary);
       state.avatar.stopAllAnimations();
       state.avatar._vmdMode = false;
       state.avatar._vmdModePureJS = true;

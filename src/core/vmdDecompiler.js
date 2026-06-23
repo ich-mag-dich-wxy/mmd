@@ -263,8 +263,8 @@ export async function textToVMD(text, onProgress) {
     else if (line.startsWith('model: ')) modelName = line.slice(7).trim();
   }
 
-  if (maxBoneFrames === 0) {
-    throw new Error('没有骨骼帧数据可编译');
+  if (maxBoneFrames === 0 && maxMorphFrames === 0) {
+    throw new Error('文本中没有骨骼帧(b)或表情帧(m)数据可编译');
   }
 
   // 预分配 VMD buffer（按最大可能大小分配，+8 字节给 cameraCount + lightCount）
@@ -589,11 +589,301 @@ function findBoneFuzzy(vmdBoneName, boneMap) {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  十分强大的表情（Morph）匹配系统
+//  参考 MMD-MPL-with-facial-expressions/src/morph.rs 的英日映射
+//  并大幅扩充，覆盖标准MMD/TDA/式微/ミクダヨー等常见模型的表情名
+//  匹配策略：精确 → 别名 → 反向别名 → 大小写忽略 → 片假名↔平假名
+//           → 去空格/符号 → 包含匹配 → 编辑距离
+// ═══════════════════════════════════════════════════════════
+
+// 标准日文名 → 所有可能的别名（英文/片假名/平假名/汉字/变体）
+// 涵盖标准MMD、TDA式、式微式、ミクダヨー、DD式等常见模型的表情命名
+const MORPH_ALIASES = {
+  // ── 元音 / 口型 ──
+  'あ': ['a', 'A', 'ア', '口あ', 'あ1', 'a口', 'vowel_a', 'あA'],
+  'い': ['i', 'I', 'イ', '口い', 'い1', 'i口', 'vowel_i', 'いI'],
+  'う': ['u', 'U', 'ウ', '口う', 'う1', 'u口', 'vowel_u', 'うU'],
+  'え': ['e', 'E', 'エ', '口え', 'え1', 'e口', 'vowel_e', 'えE'],
+  'お': ['o', 'O', 'オ', '口お', 'お1', 'o口', 'vowel_o', 'おO'],
+  '□': ['mouth_open', 'mouthOpen', 'MouthOpen', '口開け', '口開き', '口あけ', 'おっ', 'あんあん', 'くわえる', '口', 'square', 'Square', '□口', 'open_mouth', 'openMouth'],
+  'ω': ['omega', 'Omega', 'おめが', 'ω口', 'おっ2'],
+
+  // ── 笑容 ──
+  '笑い': ['smile', 'laugh', 'Smile', 'Laugh', 'スマイル', '笑顔', 'にっこり', 'ニッコリ', 'にこり', 'ニコリ', 'にこ', 'ニコ', 'わらい', 'ワライ', 'smile1', 'にっこ', 'ニッコ', 'happy', 'Happy'],
+  'にやり': ['grin', 'Grin', 'にや', 'ニヤリ', 'ニヤ', 'にやり2', 'にやー', 'ニヤー', 'sneer', 'Sneer', 'smirk', 'Smirk'],
+  'なごみ': ['gentle', 'Gentle', 'なごみ', 'ナゴミ', '和み', 'calm', 'Calm', 'soft_smile', 'softSmile', 'ほほえみ', '微笑み', '微笑', 'ほほえむ'],
+
+  // ── 情绪 ──
+  '怒り': ['angry', 'Angry', 'アングリー', '怒', '怒る', 'おこ', 'オコ', '怒り1', 'mad', 'Mad', 'rage', 'Rage', 'pissed', 'angry1'],
+  '困る': ['troubled', 'Troubled', '困', '困り', 'こまる', 'コマル', 'はぅ', 'ハゥ', '困り1', 'worried', 'Worried', 'trouble', 'Trouble'],
+  '悲しい': ['sad', 'Sad', '悲', '悲しみ', 'かなしい', 'カナシイ', '泣き', '泣き顔', 'cry', 'Cry', 'crying', 'depressed', 'sad1'],
+  'びっくり': ['surprised', 'Surprised', 'ビックリ', 'びっく', '驚き', '驚', 'びっくり1', 'shock', 'Shock', 'surprise', 'Surprise', 'ビックリ1', 'オドロキ'],
+  '真面目': ['serious', 'Serious', 'シリアス', 'まじめ', 'マジメ', 'normal', 'Normal', 'default', 'Default', '無表情', 'めがね'],
+  'はぁと': ['heart', 'Heart', 'ハート', 'はあと', '♡', 'love', 'Love', 'はーと', 'ハァト', 'heart1', '♡1', 'ラブ', 'れぶ'],
+  '照れ': ['blush', 'Blush', 'ブラッシュ', '赤面', 'てれ', '照', '頬染め', 'てれ2', '照れ1', 'embarrassed', 'Embarrassed', 'shy', 'Shy', '赤っ恥'],
+  'ぷん': ['puff', 'Puff', 'ぷん', 'プン', '怒りぷん', 'ふくれ', 'ふくれ顔', 'pout', 'Pout', 'むす', 'ムス'],
+
+  // ── 眼睛 ──
+  '瞬き': ['blink', 'Blink', 'ブリンク', 'まばたき', 'まばた', '瞬', 'ばっく', 'まばたき1', 'blink1', 'eye_close', 'eyeClose', 'EyeClose', '目閉じ', '目パチ', 'close_eyes', 'closeEyes'],
+  'ウインク': ['wink', 'Wink', 'ウィンク', 'ウインク右', 'ウインク左', 'ばっくR', 'ばっくL', 'wink1', 'eye_wink'],
+  'ウインク右': ['wink_r', 'winkR', 'WinkR', 'Wink_Right', 'ウインクＲ', 'ウィンク右', 'ばっくR', 'blink_r', 'blinkR', 'wink_right', 'winkRight', 'ウインク1', '右ウインク', '右ウィンク'],
+  'ウインク左': ['wink_l', 'winkL', 'WinkL', 'Wink_Left', 'ウインクＬ', 'ウィンク左', 'ばっくL', 'blink_l', 'blinkL', 'wink_left', 'winkLeft', 'ウインク2', '左ウインク', '左ウィンク'],
+  '半目': ['half_close', 'halfClose', 'HalfClose', 'half_closed', 'ハーフクローズ', '半眼', 'はんもく', 'half', 'Half', 'halfClose1', '目半開き', 'half_close_eye', 'halfCloseEye', 'じっとり'],
+  'じと目': ['squint', 'Squint', 'ジト目', 'じとめ', 'スカッシュ', 'ジト', 'じと', 'jitome', 'Jitome', 'squint1', '疑い', '疑う'],
+  'びっくり目': ['surprised_eye', 'surprisedEye', 'SurprisedEye', 'びっくり目', '驚き目', 'びっくり眼', '驚き眼', 'shock_eye', 'shockEye', '目びっくり'],
+  '笑い目': ['smile_eye', 'smileEye', 'SmileEye', '笑い目', 'にっこり目', 'スマイル目', '笑眼', 'happy_eye', 'happyEye', '目笑い', 'わらいめ'],
+  'なごみ目': ['gentle_eye', 'gentleEye', 'GentleEye', 'なごみ目', '和み目', 'なごみ眼', 'calm_eye', 'calmEye'],
+  '怒り目': ['angry_eye', 'angryEye', 'AngryEye', '怒り目', '怒眼', 'おこ目', 'アングリー目', 'mad_eye', 'madEye'],
+  '悲しみ目': ['sad_eye', 'sadEye', 'SadEye', '悲しみ目', '悲目', '泣き目', 'cry_eye', 'cryEye', 'crying_eye'],
+  '困り目': ['troubled_eye', 'troubledEye', 'TroubledEye', '困り目', '困眼', 'はぅ目', 'worried_eye', 'worriedEye'],
+  'はぅ目': ['troubled_eye', 'troubledEye', 'はぅ目', 'ハゥ目', '困り目2'],
+
+  // ── 瞳孔 ──
+  '瞳小': ['pupil_small', 'pupilSmall', 'PupilSmall', '瞳小さい', '瞳縮小', 'small_pupil', 'smallPupil', '瞳小1', 'こまかい瞳'],
+  '瞳大': ['pupil_big', 'pupilBig', 'PupilBig', '瞳大きい', '瞳拡大', 'big_pupil', 'bigPupil', '瞳大1', 'おおきい瞳', '瞳丸'],
+  '瞳移動': ['pupil_move', 'pupilMove', 'PupilMove', '瞳移動1', '目線', '视线', 'eye_move', 'eyeMove', '瞳動'],
+  'ハイライト消': ['highlight_off', 'highlightOff', 'HighlightOff', 'ハイライト削除', 'ハイライトなし', 'no_highlight', 'noHighlight', 'ハイライト消1', '目ハイライト消'],
+
+  // ── 眉毛 ──
+  '眉通常': ['brow_normal', 'browNormal', 'BrowNormal', '眉通常', 'まゆ通常', '眉', 'まゆ', 'brow', 'Brow', 'eyebrow_normal', 'eyebrowNormal', '眉標準'],
+  '眉怒り': ['brow_angry', 'browAngry', 'BrowAngry', '眉怒', 'まゆ怒り', '眉怒り1', 'angry_brow', 'angryBrow', '怒り眉'],
+  '眉困る': ['brow_troubled', 'browTroubled', 'BrowTroubled', '眉困', 'まゆ困る', '眉困り', 'troubled_brow', 'troubledBrow', '困り眉'],
+  '眉哀': ['brow_sad', 'browSad', 'BrowSad', '眉悲', 'まゆ悲しい', '眉悲しい', 'sad_brow', 'sadBrow', '悲しみ眉', '眉哀1'],
+  '眉上': ['brow_up', 'browUp', 'BrowUp', '眉上げ', 'まゆ上', '眉上1', 'up_brow', 'upBrow', '驚き眉'],
+  '眉下': ['brow_down', 'browDown', 'BrowDown', '眉下げ', 'まゆ下', '眉下1', 'down_brow', 'downBrow', '悲しみ眉2'],
+
+  // ── 嘴部 ──
+  '口開け': ['mouth_open', 'mouthOpen', 'MouthOpen', '口開き', '口あけ', 'おっ', 'あんあん', 'open_mouth', 'openMouth', '口開け1'],
+  '口角上げ': ['mouth_corner_up', 'mouthCornerUp', 'MouthCornerUp', '口角上', '口角上げ', 'smile_corner', '口角上1'],
+  '口角下げ': ['mouth_corner_down', 'mouthCornerDown', 'MouthCornerDown', '口角下', '口角下げ', 'sad_corner', '口角下1'],
+  '口広げ': ['mouth_wide', 'mouthWide', 'MouthWide', '口広', '口広げ', 'wide_mouth', 'wideMouth'],
+  '口尖らし': ['mouth_pucker', 'mouthPucker', 'MouthPucker', '口尖', '口尖らし', 'pucker', 'Pucker', 'すぼめる'],
+  '口への字': ['mouth_he', 'mouthHe', 'MouthHe', '口への字', 'への字', 'へ字', 'sad_mouth', 'sadMouth'],
+  'にやり口': ['grin_mouth', 'grinMouth', 'GrinMouth', 'にやり口', 'ニヤリ口', 'smirk_mouth', 'smirkMouth'],
+
+  // ── 牙齿/舌头 ──
+  '歯': ['tooth', 'Tooth', '歯見え', 'は', '歯出し', 'teeth', 'Teeth', '歯1', '歯見え1', 'tooth_show', 'toothShow'],
+  '歯無し': ['no_tooth', 'noTooth', 'NoTooth', '歯なし', '歯無', 'tooth_hide', 'toothHide'],
+  '舌': ['tongue', 'Tongue', 'タン', 'した', '舌出し', 'tongue_out', 'tongueOut', '舌1', 'べー'],
+
+  // ── 眼泪/脸颊 ──
+  '涙': ['tears', 'Tears', 'ティアー', 'なみだ', '涙目', '涙1', 'cry', 'Cry', 'tear', 'Tear', '泣き涙', '涙流し'],
+  '涙2': ['tears2', 'Tears2', '涙2', 'なみだ2', '涙目2', 'cry2', 'Cry2', 'tear2', 'Tear2'],
+  '頬染め': ['cheek_blush', 'cheekBlush', 'CheekBlush', '頬染', 'ほお染め', 'ほお赤', '頬赤', 'blush_cheek', 'blushCheek', 'cheek_red', 'cheekRed'],
+  '頬': ['cheek', 'Cheek', 'ほお', 'ホオ', '頬1', 'cheek1'],
+
+  // ── 特殊符号 ──
+  '★': ['star', 'Star', 'ほし', 'ホシ', '星', 'star_eye', 'starEye', 'StarEye', '目星', '★1'],
+  '×': ['cross', 'Cross', 'ばつ', 'バツ', '×目', '×1', 'x_eye', 'xEye', 'XEye', 'めつぶし', '目潰し', 'dead_eye', 'deadEye', '失神', '気絶'],
+  '↑': ['up', 'Up', '上', 'うえ', '↑目', 'up_eye', 'upEye'],
+  '↓': ['down', 'Down', '下', 'した', '↓目', 'down_eye', 'downEye'],
+  '→': ['right', 'Right', '右', 'みぎ', '→目', 'right_eye', 'rightEye'],
+  '←': ['left', 'Left', '左', 'ひだり', '←目', 'left_eye', 'leftEye'],
+
+  // ── 其他常见 ──
+  'まつげ': ['eyelash', 'Eyelash', 'まつげ', 'マツゲ', '睫毛', 'まつげ1', 'eyelash1', 'lash', 'Lash'],
+  '目': ['eye', 'Eye', 'め', 'メ', '目1', 'eye1'],
+  '顔赤': ['face_red', 'faceRed', 'FaceRed', '顔赤', 'かおあか', '赤面2', 'red_face', 'redFace'],
+  '青ざめ': ['pale', 'Pale', '青ざめ', '青白い', 'pale_face', 'paleFace', '顔青'],
+};
+
+// ── 片假名 ↔ 平假名 转换表 ──
+const KATA_TO_HIRA = new Map();
+const HIRA_TO_KATA = new Map();
+(function buildKanaMaps() {
+  // 平假名 3041-3094，片假名 30A1-30F4
+  for (let i = 0; i <= 93; i++) {
+    const hira = String.fromCharCode(0x3041 + i);
+    const kata = String.fromCharCode(0x30A1 + i);
+    KATA_TO_HIRA.set(kata, hira);
+    HIRA_TO_KATA.set(hira, kata);
+  }
+})();
+
+function katakanaToHiragana(str) {
+  let result = '';
+  for (const ch of str) {
+    result += KATA_TO_HIRA.get(ch) || ch;
+  }
+  return result;
+}
+
+function hiraganaToKatakana(str) {
+  let result = '';
+  for (const ch of str) {
+    result += HIRA_TO_KATA.get(ch) || ch;
+  }
+  return result;
+}
+
+// ── 全角↔半角 转换 ──
+function normalizeWidth(str) {
+  // 全角英数字→半角
+  return str.replace(/[\uFF01-\uFF5E]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+            .replace(/\u3000/g, ' '); // 全角空格
+}
+
+// ── 反向别名表（别名 → 标准日文名），运行时构建 ──
+let _reverseMorphMap = null;
+
+function getReverseMorphMap() {
+  if (_reverseMorphMap) return _reverseMorphMap;
+  _reverseMorphMap = new Map();
+  for (const [standard, aliases] of Object.entries(MORPH_ALIASES)) {
+    // 别名 → 标准名
+    for (const alias of aliases) {
+      const key = alias.toLowerCase();
+      if (!_reverseMorphMap.has(key)) _reverseMorphMap.set(key, standard);
+    }
+    // 标准名自身也加入（小写）
+    const stdKey = standard.toLowerCase();
+    if (!_reverseMorphMap.has(stdKey)) _reverseMorphMap.set(stdKey, standard);
+  }
+  return _reverseMorphMap;
+}
+
+// ── 编辑距离（Levenshtein） ──
+function levenshtein(a, b) {
+  const al = a.length, bl = b.length;
+  if (al === 0) return bl;
+  if (bl === 0) return al;
+  const prev = new Array(bl + 1);
+  const curr = new Array(bl + 1);
+  for (let j = 0; j <= bl; j++) prev[j] = j;
+  for (let i = 1; i <= al; i++) {
+    curr[0] = i;
+    const ac = a.charCodeAt(i - 1);
+    for (let j = 1; j <= bl; j++) {
+      const cost = ac === b.charCodeAt(j - 1) ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    for (let j = 0; j <= bl; j++) prev[j] = curr[j];
+  }
+  return prev[bl];
+}
+
+/**
+ * 十分强大的表情名模糊匹配
+ * @param {string} vmdMorphName - VMD 中的表情名（可能是日文/英文/别名/变体）
+ * @param {Object} morphDict - 模型的 morphTargetDictionary { name: index }
+ * @returns {number|undefined} morph 索引，未找到返回 undefined
+ */
+function findMorphFuzzy(vmdMorphName, morphDict) {
+  if (!morphDict || !vmdMorphName) return undefined;
+
+  // 1. 精确匹配
+  if (morphDict[vmdMorphName] !== undefined) return morphDict[vmdMorphName];
+
+  // 2. 别名匹配：VMD名 → 标准日文名 → 模型中可能的名
+  const aliases = MORPH_ALIASES[vmdMorphName];
+  if (aliases) {
+    for (const alias of aliases) {
+      if (morphDict[alias] !== undefined) return morphDict[alias];
+    }
+  }
+
+  // 3. 反向别名匹配：VMD名可能是英文别名，查找对应的标准日文名
+  const reverseMap = getReverseMorphMap();
+  const standardName = reverseMap.get(vmdMorphName.toLowerCase());
+  if (standardName) {
+    if (morphDict[standardName] !== undefined) return morphDict[standardName];
+    // 标准名的别名也试一下
+    const stdAliases = MORPH_ALIASES[standardName];
+    if (stdAliases) {
+      for (const alias of stdAliases) {
+        if (morphDict[alias] !== undefined) return morphDict[alias];
+      }
+    }
+  }
+
+  // 4. 大小写忽略匹配
+  const lowerName = vmdMorphName.toLowerCase();
+  for (const name in morphDict) {
+    if (name.toLowerCase() === lowerName) return morphDict[name];
+  }
+
+  // 5. 全角→半角归一化后匹配
+  const normalizedVmd = normalizeWidth(vmdMorphName);
+  if (normalizedVmd !== vmdMorphName) {
+    if (morphDict[normalizedVmd] !== undefined) return morphDict[normalizedVmd];
+    const normLower = normalizedVmd.toLowerCase();
+    for (const name in morphDict) {
+      if (normalizeWidth(name).toLowerCase() === normLower) return morphDict[name];
+    }
+  }
+
+  // 6. 片假名 ↔ 平假名 转换后匹配
+  const vmdAsHira = katakanaToHiragana(vmdMorphName);
+  const vmdAsKata = hiraganaToKatakana(vmdMorphName);
+  if (vmdAsHira !== vmdMorphName) {
+    if (morphDict[vmdAsHira] !== undefined) return morphDict[vmdAsHira];
+  }
+  if (vmdAsKata !== vmdMorphName) {
+    if (morphDict[vmdAsKata] !== undefined) return morphDict[vmdAsKata];
+  }
+  // 转换后的小写匹配
+  const hiraLower = vmdAsHira.toLowerCase();
+  const kataLower = vmdAsKata.toLowerCase();
+  for (const name in morphDict) {
+    const nameHira = katakanaToHiragana(name);
+    const nameKata = hiraganaToKatakana(name);
+    if (nameHira.toLowerCase() === hiraLower || nameKata.toLowerCase() === kataLower) {
+      return morphDict[name];
+    }
+  }
+
+  // 7. 去空格/下划线/横线后匹配
+  const stripSep = s => s.replace(/[\s_\-]/g, '');
+  const vmdStripped = stripSep(vmdMorphName).toLowerCase();
+  if (vmdStripped !== lowerName) {
+    for (const name in morphDict) {
+      if (stripSep(name).toLowerCase() === vmdStripped) return morphDict[name];
+    }
+  }
+
+  // 8. 包含匹配（VMD名是模型名的子串，或反之，长度≥2避免误匹配）
+  if (vmdMorphName.length >= 2) {
+    for (const name in morphDict) {
+      if (name.length < 2) continue;
+      const lowerModel = name.toLowerCase();
+      if (lowerModel.includes(lowerName) || lowerName.includes(lowerModel)) {
+        return morphDict[name];
+      }
+    }
+    // 片假名/平假名形式的包含匹配
+    for (const name in morphDict) {
+      if (name.length < 2) continue;
+      const nameHira = katakanaToHiragana(name).toLowerCase();
+      if (nameHira.includes(hiraLower) || hiraLower.includes(nameHira)) {
+        return morphDict[name];
+      }
+    }
+  }
+
+  // 9. 编辑距离匹配（最后手段，距离≤2 且长度≥3）
+  if (vmdMorphName.length >= 3) {
+    let bestIdx = undefined;
+    let bestDist = 3; // 最大容忍距离
+    for (const name in morphDict) {
+      if (name.length < 3) continue;
+      const dist = levenshtein(lowerName, name.toLowerCase());
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = morphDict[name];
+      }
+    }
+    if (bestIdx !== undefined) return bestIdx;
+  }
+
+  return undefined;
+}
+
+// ═══════════════════════════════════════════════════════════
 //  Text → Pure-JS 直接播放
 //  文本中已是右手坐标系，可直接用于 Three.js 骨骼
 // ═══════════════════════════════════════════════════════════
 
-export function createDirectAnimationClip(text, skeleton) {
+export function createDirectAnimationClip(text, skeleton, morphDict) {
   const bones = skeleton.bones;
   const boneMap = {};
   for (let i = 0; i < bones.length; i++) boneMap[bones[i].name] = i;
@@ -602,7 +892,10 @@ export function createDirectAnimationClip(text, skeleton) {
   const morphTracksPerName = {};
   let mapped = 0, missed = 0;
   const missedBones = new Set();
-  const fuzzyMatched = new Map(); // 缓存模糊匹配结果
+  const fuzzyMatched = new Map(); // 缓存骨骼模糊匹配结果
+  const morphFuzzyMatched = new Map(); // 缓存表情模糊匹配结果
+  let morphMapped = 0, morphMissed = 0;
+  const missedMorphs = new Set();
 
   const lines = text.split('\n');
   for (let li = 0; li < lines.length; li++) {
@@ -638,8 +931,9 @@ export function createDirectAnimationClip(text, skeleton) {
     } else {
       const parts = line.split(/\s+/);
       if (parts.length < 4) continue;
-      if (!morphTracksPerName[parts[1]]) morphTracksPerName[parts[1]] = [];
-      morphTracksPerName[parts[1]].push({ frameNum: parseInt(parts[2], 10), time: parseInt(parts[2], 10) / 30, weight: parseFloat(parts[3]) });
+      const vmdMorphName = parts[1];
+      if (!morphTracksPerName[vmdMorphName]) morphTracksPerName[vmdMorphName] = [];
+      morphTracksPerName[vmdMorphName].push({ frameNum: parseInt(parts[2], 10), time: parseInt(parts[2], 10) / 30, weight: parseFloat(parts[3]) });
     }
   }
 
@@ -649,21 +943,52 @@ export function createDirectAnimationClip(text, skeleton) {
     tracks.push({ boneIdx: parseInt(idx), keyframes: kfs.map(kf => ({ time: kf.time, pos: kf.pos.clone(), quat: kf.quat.clone() })) });
   }
 
+  // 构建表情轨道：使用模糊匹配解析 morph 名 → morphIdx
   const morphTracks = [];
-  for (const [name, kfs] of Object.entries(morphTracksPerName)) {
+  for (const [vmdName, kfs] of Object.entries(morphTracksPerName)) {
     kfs.sort((a, b) => a.frameNum - b.frameNum);
-    morphTracks.push({ morphName: name, keyframes: kfs.map(kf => ({ time: kf.time, weight: kf.weight })) });
+    const keyframes = kfs.map(kf => ({ time: kf.time, weight: kf.weight }));
+
+    // 如果有 morphDict，尝试模糊匹配到模型的 morph 索引
+    let morphIdx = undefined;
+    if (morphDict) {
+      morphIdx = morphFuzzyMatched.get(vmdName);
+      if (morphIdx === undefined) {
+        morphIdx = findMorphFuzzy(vmdName, morphDict);
+        morphFuzzyMatched.set(vmdName, morphIdx !== undefined ? morphIdx : -1);
+      } else if (morphIdx === -1) {
+        morphIdx = undefined;
+      }
+    }
+
+    if (morphIdx !== undefined) {
+      morphMapped++;
+      morphTracks.push({ morphName: vmdName, morphIdx, keyframes });
+    } else {
+      // 即使没匹配到也保留，运行时可能模型切换后能匹配
+      morphMissed++;
+      missedMorphs.add(vmdName);
+      morphTracks.push({ morphName: vmdName, morphIdx: undefined, keyframes });
+    }
   }
 
-  if (tracks.length === 0) throw new Error(`没有可播放的骨骼轨道（${missed} 帧未匹配）`);
+  if (tracks.length === 0 && morphTracks.length === 0) {
+    throw new Error(`没有可播放的骨骼或表情轨道（骨骼${missed}帧未匹配）`);
+  }
 
-  const totalTime = tracks.reduce((max, t) => {
+  // 总时长：骨骼轨道和表情轨道取最大值
+  let totalTime = tracks.reduce((max, t) => {
     const last = t.keyframes[t.keyframes.length - 1];
     return last ? Math.max(max, last.time) : max;
   }, 0);
+  totalTime = morphTracks.reduce((max, mt) => {
+    const last = mt.keyframes[mt.keyframes.length - 1];
+    return last ? Math.max(max, last.time) : max;
+  }, totalTime);
 
-  console.log(`[VMD] 直接播放: ${tracks.length}骨骼轨道, ${morphTracks.length}表情轨道, ${mapped}帧已匹配, ${missed}帧未匹配`);
+  console.log(`[VMD] 直接播放: ${tracks.length}骨骼轨道, ${morphTracks.length}表情轨道, 骨骼${mapped}帧已匹配/${missed}帧未匹配, 表情${morphMapped}匹配/${morphMissed}未匹配`);
   if (missedBones.size > 0) console.log(`[VMD] 未找到的骨骼: ${[...missedBones].slice(0, 10).join(', ')}${missedBones.size > 10 ? '...' : ''}`);
+  if (missedMorphs.size > 0) console.log(`[VMD] 未找到的表情: ${[...missedMorphs].slice(0, 10).join(', ')}${missedMorphs.size > 10 ? '...' : ''}`);
 
   return { name: 'vmd_direct', duration: totalTime + 0.5, tracks, morphTracks };
 }
