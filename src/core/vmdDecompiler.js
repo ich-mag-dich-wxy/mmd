@@ -112,7 +112,7 @@ function buildShiftJISEncodeMap() {
   return _shiftJISEncodeMap;
 }
 
-function encodeShiftJISInto(str, view, offset, maxLen) {
+export function encodeShiftJISInto(str, view, offset, maxLen) {
   const map = buildShiftJISEncodeMap();
   let pos = 0;
   for (let i = 0; i < str.length && pos < maxLen; i++) {

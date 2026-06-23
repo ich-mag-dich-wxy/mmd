@@ -16,7 +16,7 @@
 
   <div class="header">
     <h1>MMD Viewer</h1>
-    <span class="subtitle">加载 MMD 模型，播放 VMD 动作，反编译/编译 VMD</span>
+    <span class="subtitle">加载 MMD 模型 · 播放 VMD · 反编译/编译 · 摄像头动作捕捉</span>
   </div>
 
   <div class="info-panel">
@@ -83,6 +83,17 @@
     <div class="editor-status" id="editor-status">就绪</div>
   </div>
 
+  <!-- 摄像头预览面板 -->
+  <div class="pose-panel" id="pose-panel">
+    <div class="pose-panel-header">
+      <span>摄像头预览</span>
+      <button class="pose-close" id="pose-close">×</button>
+    </div>
+    <video id="pose-video" autoplay playsinline muted></video>
+    <canvas id="pose-canvas" width="320" height="240"></canvas>
+  </div>
+
+  <!-- 底部控制栏 -->
   <div class="controls-bar">
     <button class="control-btn" id="btn-play" title="播放/暂停">⏯️</button>
     <button class="control-btn" id="btn-reset-camera" title="重置视角">📷</button>
@@ -91,10 +102,15 @@
       <input type="range" id="speed-slider" min="0.1" max="3" step="0.1" value="1" />
       <span id="speed-label">1.0x</span>
     </div>
+    <div class="control-divider"></div>
+    <button class="control-btn camera-btn" id="btn-camera" title="启动/停止摄像头动作捕捉">📷 摄像头</button>
+    <button class="control-btn record-btn" id="btn-record" title="开始/停止录制">🔴 录制</button>
+    <button class="control-btn snapshot-btn" id="btn-snapshot" title="保存当前姿势为 VMD">📸 快照</button>
+    <span class="record-status" id="record-status"></span>
   </div>
 
   <div class="footer-hint">
-    💡 鼠标左键旋转 | 右键平移 | 滚轮缩放
+    💡 鼠标左键旋转 | 右键平移 | 滚轮缩放 | 摄像头捕捉需 Chrome/Edge 浏览器
   </div>
 
   <script src="/ammo.wasm.js"></script>

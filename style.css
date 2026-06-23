@@ -399,16 +399,19 @@ body {
   z-index: 10;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   background: rgba(0, 0, 0, 0.6);
   backdrop-filter: blur(14px);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
-  padding: 8px 16px;
+  padding: 8px 14px;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: calc(100vw - 32px);
 }
 
 .control-btn {
-  padding: 6px 14px;
+  padding: 6px 12px;
   font-size: 12px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 8px;
@@ -428,6 +431,47 @@ body {
 
 .control-btn:active {
   transform: translateY(0);
+}
+
+.camera-btn {
+  background: linear-gradient(135deg, #3a7bd5, #00d2ff);
+  color: #fff;
+  border: none;
+}
+
+.record-btn {
+  background: linear-gradient(135deg, #e74c3c, #c0392b);
+  color: #fff;
+  border: none;
+}
+
+.record-btn.recording {
+  animation: pulse-red 1s infinite;
+}
+
+@keyframes pulse-red {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.5); }
+  50% { box-shadow: 0 0 0 8px rgba(231, 76, 60, 0); }
+}
+
+.snapshot-btn {
+  background: linear-gradient(135deg, #f39c12, #e67e22);
+  color: #fff;
+  border: none;
+}
+
+.control-divider {
+  width: 1px;
+  height: 24px;
+  background: rgba(255, 255, 255, 0.12);
+  margin: 0 4px;
+}
+
+.record-status {
+  font-size: 11px;
+  color: #e74c3c;
+  white-space: nowrap;
+  min-width: 60px;
 }
 
 .speed-control {
@@ -531,4 +575,62 @@ body {
   .footer-hint {
     display: none;
   }
+}
+
+/* ═══ 摄像头预览面板 ═══ */
+.pose-panel {
+  display: none;
+  position: fixed;
+  bottom: 80px;
+  right: 16px;
+  z-index: 15;
+  width: 320px;
+  background: rgba(15, 15, 30, 0.85);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.pose-panel.active {
+  display: block;
+}
+
+.pose-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #ccc;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.pose-close {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.pose-close:hover {
+  color: #fff;
+}
+
+#pose-video {
+  display: none;
+  width: 320px;
+  height: 240px;
+  object-fit: cover;
+}
+
+#pose-canvas {
+  display: block;
+  width: 320px;
+  height: 240px;
+  background: #000;
 }

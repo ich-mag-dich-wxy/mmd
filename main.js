@@ -4,6 +4,8 @@ import { MMDLoader } from 'three/addons/loaders/MMDLoader.js';
 import { MMDAnimationHelper } from 'three/addons/animation/MMDAnimationHelper.js';
 import { createAvatar } from './src/core/avatarCore.js';
 import { vmdToText, textToVMD, createDirectAnimationClip, downloadVMD } from './src/core/vmdDecompiler.js';
+import { initPoseCapture, solvePoseToBones, drawPoseCanvas } from './src/core/poseCapture.js';
+import { VMDRecorder, saveRecording, saveSnapshot } from './src/core/vmdRecorder.js';
 
 const state = {
   mesh: null,
@@ -22,6 +24,13 @@ const state = {
   vmdFileName: '',
   mplFileText: null,
   mplFileName: '',
+  // 摄像头动作捕捉
+  poseCapture: null,
+  poseActive: false,
+  poseLandmarks: null,
+  // 录制/快照
+  recorder: null,
+  isRecording: false,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -318,22 +327,73 @@ function handleFolderUpload(files) {
   loadMMD();
 }
 
+function applyPoseToMesh(landmarks) {
+  if (!state.mesh || !state.mesh.skeleton) return;
+
+  const bones = state.mesh.skeleton.bones;
+  const boneMap = {};
+  for (let i = 0; i < bones.length; i++) boneMap[bones[i].name] = i;
+
+  const poseData = solvePoseToBones(landmarks, boneMap);
+
+  for (const boneName in poseData) {
+    const data = poseData[boneName];
+    const bone = bones[data.idx];
+    if (!bone) continue;
+    bone.quaternion.copy(data.quat);
+    bone.matrixWorldNeedsUpdate = true;
+  }
+
+  for (const bone of bones) {
+    if (!bone.parent || !bone.parent.isBone) {
+      bone.updateMatrixWorld(true);
+    }
+  }
+  state.mesh.skeleton.update();
+  if (state.mesh.skeleton.boneTexture) {
+    state.mesh.skeleton.computeBoneTexture();
+  }
+}
+
 function animate() {
   requestAnimationFrame(animate);
   const delta = state.clock.getDelta();
 
   if (state.isPlaying) {
     controls.update();
-    if (state.helper) {
+
+    // 摄像头动作捕捉优先
+    if (state.poseActive && state.poseLandmarks && state.mesh) {
+      applyPoseToMesh(state.poseLandmarks);
+    } else if (state.helper) {
       state.helper.update(delta);
     }
-    if (state.avatar && !state.avatar._vmdMode) {
+
+    // 持续绘制摄像头预览（即使没有检测结果也画视频画面）
+    if (state.poseActive && state.poseCapture) {
+      const canvasEl = $('#pose-canvas');
+      const videoEl = $('#pose-video');
+      if (canvasEl && videoEl && videoEl.readyState >= 2) {
+        const ctx = canvasEl.getContext('2d');
+        drawPoseCanvas(ctx, state.poseLandmarks, canvasEl.width, canvasEl.height, videoEl);
+      }
+    }
+
+    if (state.avatar && !state.avatar._vmdMode && !state.poseActive) {
       state.avatar.userWorldPos.set(
         camera.position.x * 0.3,
         camera.position.y * 0.3,
         camera.position.z * 0.3,
       );
       state.avatar.update(delta);
+    }
+
+    // 录制中
+    if (state.isRecording && state.recorder) {
+      state.recorder.captureFrame();
+      const dur = state.recorder.getDuration();
+      const frames = state.recorder.getFrameCount();
+      $('#record-status').textContent = `🔴 录制中: ${frames}帧 / ${dur.toFixed(1)}秒`;
     }
   }
 
@@ -390,6 +450,23 @@ $('#speed-slider').addEventListener('input', () => {
   const val = parseFloat($('#speed-slider').value);
   $('#speed-label').textContent = val.toFixed(1) + 'x';
   state.helper.setAnimationSpeed(val);
+});
+
+// 摄像头、录制、快照
+$('#btn-camera').addEventListener('click', () => {
+  if (state.poseActive) stopCamera();
+  else startCamera();
+});
+
+$('#btn-record').addEventListener('click', () => {
+  if (state.isRecording) stopRecording();
+  else startRecording();
+});
+
+$('#btn-snapshot').addEventListener('click', takeSnapshot);
+
+$('#pose-close').addEventListener('click', () => {
+  if (state.poseActive) stopCamera();
 });
 
 $('#btn-decompile').addEventListener('click', async () => {
@@ -514,6 +591,141 @@ $('#btn-compile').addEventListener('click', async () => {
     }
   });
 });
+
+// ═══════════════════════════════════════════════════════════
+//  摄像头动作捕捉
+// ═══════════════════════════════════════════════════════════
+
+async function startCamera() {
+  if (!state.mesh) {
+    editorStatus.textContent = '⚠️ 请先加载模型';
+    return;
+  }
+
+  const videoEl = $('#pose-video');
+  const canvasEl = $('#pose-canvas');
+  const ctx = canvasEl.getContext('2d');
+
+  try {
+    editorStatus.textContent = '正在加载姿态检测模型（首次需下载，约10秒）...';
+
+    state.poseCapture = await initPoseCapture(videoEl, (results) => {
+      state.poseLandmarks = results;
+      drawPoseCanvas(ctx, state.poseLandmarks, canvasEl.width, canvasEl.height, videoEl);
+    }, (msg) => {
+      editorStatus.textContent = '📷 ' + msg;
+    });
+    state.poseActive = true;
+
+    // 停止 VMD 动画
+    if (state.avatar) {
+      state.avatar.stopAllAnimations();
+      state.avatar._vmdMode = false;
+    }
+    try { state.helper.remove(state.mesh); } catch(e) {}
+
+    $('#pose-panel').classList.add('active');
+    $('#btn-camera').textContent = '⏹ 停止';
+    editorStatus.textContent = '📷 摄像头已启动，动作捕捉中';
+  } catch (err) {
+    editorStatus.textContent = `❌ 摄像头启动失败: ${err.message}`;
+    console.error('[Pose] 启动失败:', err);
+  }
+}
+
+function stopCamera() {
+  if (state.poseCapture) {
+    state.poseCapture.stop();
+    state.poseCapture = null;
+  }
+  state.poseActive = false;
+  state.poseLandmarks = null;
+  $('#pose-panel').classList.remove('active');
+  $('#btn-camera').textContent = '📷 摄像头';
+
+  // 恢复骨骼到 rest
+  if (state.avatar) {
+    state.avatar.stopAllAnimations();
+  }
+  editorStatus.textContent = '摄像头已停止';
+}
+
+// ═══════════════════════════════════════════════════════════
+//  录制
+// ═══════════════════════════════════════════════════════════
+
+function startRecording() {
+  if (!state.mesh) {
+    editorStatus.textContent = '⚠️ 请先加载模型';
+    return;
+  }
+
+  state.recorder = new VMDRecorder(state.mesh);
+  state.recorder.start();
+  state.isRecording = true;
+  $('#btn-record').textContent = '⏹ 停止';
+  $('#btn-record').classList.add('recording');
+  $('#record-status').textContent = '🔴 录制中...';
+  editorStatus.textContent = '🔴 开始录制';
+}
+
+async function stopRecording() {
+  if (!state.isRecording || !state.recorder) return;
+
+  state.isRecording = false;
+  const vmdData = state.recorder.stop();
+  const frameCount = state.recorder.getFrameCount();
+
+  const fileName = prompt('请输入录制文件名:', 'recording_' + Date.now());
+  if (!fileName) {
+    $('#btn-record').textContent = '🔴 录制';
+    $('#btn-record').classList.remove('recording');
+    $('#record-status').textContent = '';
+    state.recorder = null;
+    editorStatus.textContent = '已取消保存';
+    return;
+  }
+
+  try {
+    const path = await saveRecording(fileName, vmdData);
+    editorStatus.textContent = `✅ 已保存: ${path} (${frameCount}帧)`;
+    $('#record-status').textContent = `已保存: ${fileName}.vmd`;
+  } catch (err) {
+    editorStatus.textContent = `❌ 保存失败: ${err.message}`;
+    $('#record-status').textContent = '';
+  }
+
+  $('#btn-record').textContent = '🔴 录制';
+  $('#btn-record').classList.remove('recording');
+  state.recorder = null;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  快照
+// ═══════════════════════════════════════════════════════════
+
+async function takeSnapshot() {
+  if (!state.mesh) {
+    editorStatus.textContent = '⚠️ 请先加载模型';
+    return;
+  }
+
+  const recorder = new VMDRecorder(state.mesh);
+  const vmdData = recorder.snapshot();
+
+  const fileName = prompt('请输入快照文件名:', 'snapshot_' + Date.now());
+  if (!fileName) {
+    editorStatus.textContent = '已取消保存';
+    return;
+  }
+
+  try {
+    const path = await saveSnapshot(fileName, vmdData);
+    editorStatus.textContent = `✅ 快照已保存: ${path}`;
+  } catch (err) {
+    editorStatus.textContent = `❌ 保存失败: ${err.message}`;
+  }
+}
 
 async function init() {
   await initAmmo();
