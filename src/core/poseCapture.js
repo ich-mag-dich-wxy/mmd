@@ -1,14 +1,17 @@
 import * as THREE from 'three';
+import { OneEuroFilterVec3, OneEuroFilterQuat } from '../utils/oneEuroFilter.js';
 
 // ═══════════════════════════════════════════════════════════
-//  MediaPipe Tasks Vision → MMD 骨骼映射
-//  使用 2D 角度 + 欧拉角方案（比 3D 向量旋转更稳定）
-//  原理：MediaPipe 的 x/y 精度高，z 精度低
-//        所以用 x/y 计算主旋转角，z 做辅助
+//  MediaPipe → MMD 骨骼映射
+//  核心改进：
+//  1. 骨骼名模糊匹配（支持英文名/别名）
+//  2. 正确的FK链（预计算restWorldQuats）
+//  3. 详细调试日志
+//  4. One-Euro滤波 + 四元数slerp平滑
 // ═══════════════════════════════════════════════════════════
 
 const MP = {
-  NOSE: 0,
+  NOSE: 0, LEFT_EAR: 7, RIGHT_EAR: 8,
   LEFT_SHOULDER: 11, RIGHT_SHOULDER: 12,
   LEFT_ELBOW: 13, RIGHT_ELBOW: 14,
   LEFT_WRIST: 15, RIGHT_WRIST: 16,
@@ -17,255 +20,367 @@ const MP = {
   LEFT_ANKLE: 27, RIGHT_ANKLE: 28,
 };
 
-let _landmarks = null;
+const VIS_THRESH = 0.3;
+const SCALE = 2.0;
 
-function lm(idx) {
-  return _landmarks && _landmarks[idx] ? _landmarks[idx] : null;
+// ── 骨骼名别名表（用于模糊匹配） ──
+const BONE_ALIASES = {
+  '下半身': ['下半身', 'lower_body', 'LowerBody', 'lower body', 'hips', 'Hips', 'pelvis', 'Pelvis'],
+  '上半身': ['上半身', 'upper_body', 'UpperBody', 'upper body', 'spine', 'Spine', 'chest', 'Chest'],
+  '首': ['首', 'neck', 'Neck'],
+  '頭': ['頭', 'head', 'Head'],
+  '右腕': ['右腕', 'right_arm', 'RightArm', 'right arm', 'rightUpperArm'],
+  '左腕': ['左腕', 'left_arm', 'LeftArm', 'left arm', 'leftUpperArm'],
+  '右ひじ': ['右ひじ', 'right_elbow', 'RightElbow', 'right elbow', 'rightForeArm', 'rightLowerArm'],
+  '左ひじ': ['左ひじ', 'left_elbow', 'LeftElbow', 'left elbow', 'leftForeArm', 'leftLowerArm'],
+  '右足': ['右足', 'right_leg', 'RightLeg', 'right leg', 'rightUpperLeg', 'rightThigh'],
+  '左足': ['左足', 'left_leg', 'LeftLeg', 'left leg', 'leftUpperLeg', 'leftThigh'],
+  '右ひざ': ['右ひざ', 'right_knee', 'RightKnee', 'right knee', 'rightLowerLeg', 'rightShin'],
+  '左ひざ': ['左ひざ', 'left_knee', 'LeftKnee', 'left knee', 'leftLowerLeg', 'leftShin'],
+  '右足首': ['右足首', 'right_ankle', 'RightAnkle', 'right ankle', 'rightFoot'],
+  '左足首': ['左足首', 'left_ankle', 'LeftAnkle', 'left ankle', 'leftFoot'],
+};
+
+// 构建反向查找表：别名 → 标准名
+const _aliasToStandard = {};
+for (const [std, aliases] of Object.entries(BONE_ALIASES)) {
+  for (const a of aliases) _aliasToStandard[a.toLowerCase()] = std;
 }
 
-function avg(idxA, idxB) {
-  const a = lm(idxA), b = lm(idxB);
-  if (!a || !b) return null;
-  return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 };
-}
+/**
+ * 骨骼名模糊匹配：将模型骨骼名映射到标准MMD骨骼名
+ */
+function buildBoneMap(bones) {
+  const boneMap = {};
+  const modelNames = bones.map(b => b.name);
+  const modelNamesLower = modelNames.map(n => n.toLowerCase());
 
-// ── 角度计算 ──
-// 以"向下"为 0，顺时针为正（atan2(dx, dy)，MP y 向下为正）
-// 返回 [-π, π]
-function angleFromDown(from, to) {
-  if (!from || !to) return 0;
-  const dx = to.x - from.x;
-  const dy = to.y - from.y;
-  return Math.atan2(dx, dy);
-}
+  for (const [stdName, aliases] of Object.entries(BONE_ALIASES)) {
+    let found = -1;
+    // 1. 精确匹配
+    for (let i = 0; i < modelNames.length; i++) {
+      if (modelNames[i] === stdName) { found = i; break; }
+    }
+    // 2. 别名匹配
+    if (found < 0) {
+      for (const alias of aliases) {
+        for (let i = 0; i < modelNames.length; i++) {
+          if (modelNames[i] === alias) { found = i; break; }
+        }
+        if (found >= 0) break;
+      }
+    }
+    // 3. 大小写忽略
+    if (found < 0) {
+      const stdLower = stdName.toLowerCase();
+      for (let i = 0; i < modelNames.length; i++) {
+        if (modelNamesLower[i] === stdLower) { found = i; break; }
+      }
+    }
+    // 4. 别名大小写忽略
+    if (found < 0) {
+      for (const alias of aliases) {
+        const al = alias.toLowerCase();
+        for (let i = 0; i < modelNames.length; i++) {
+          if (modelNamesLower[i] === al) { found = i; break; }
+        }
+        if (found >= 0) break;
+      }
+    }
+    // 5. 包含匹配
+    if (found < 0) {
+      for (let i = 0; i < modelNames.length; i++) {
+        const nl = modelNamesLower[i];
+        if (nl.includes(stdName.toLowerCase()) || stdName.toLowerCase().includes(nl)) {
+          found = i; break;
+        }
+      }
+    }
 
-// 以"向上"为 0
-function angleFromUp(from, to) {
-  if (!from || !to) return 0;
-  const dx = to.x - from.x;
-  const dy = to.y - from.y;
-  return Math.atan2(dx, -dy);
-}
-
-function clamp(v, min, max) {
-  return Math.max(min, Math.min(max, v));
-}
-
-// ── 平滑滤波 ──
-const _smooth = {}; // boneName → { value, velocity }
-const SMOOTH = 0.2; // 越小越平滑
-
-function smoothValue(name, target) {
-  const s = _smooth[name];
-  if (!s) {
-    _smooth[name] = { value: target };
-    return target;
+    if (found >= 0) {
+      boneMap[stdName] = found;
+    }
   }
-  s.value += (target - s.value) * SMOOTH;
-  return s.value;
+
+  return boneMap;
 }
 
-function resetSmoothing() {
-  for (const k in _smooth) delete _smooth[k];
+// ── 滤波器 ──
+let _lmFilters = null;
+let _quatFilters = {};
+
+function ensureLmFilters() {
+  if (!_lmFilters) {
+    _lmFilters = [];
+    for (let i = 0; i < 33; i++) _lmFilters.push(new OneEuroFilterVec3({ minCutoff: 1.0, beta: 0.05 }));
+  }
+  return _lmFilters;
 }
 
-// ── 从欧拉角创建四元数 ──
-function quatFromEuler(x, y, z) {
-  return new THREE.Quaternion().setFromEuler(new THREE.Euler(x, y, z, 'XYZ'));
+function getQF(name) {
+  if (!_quatFilters[name]) _quatFilters[name] = new OneEuroFilterQuat({ minCutoff: 1.5, beta: 0.1 });
+  return _quatFilters[name];
 }
+
+function resetFilters() { _lmFilters = null; _quatFilters = {}; }
+
+// ── 校准 ──
+let _calib = null;
+let _mirror = true;
+let _boneMapCache = null;
+let _debugCount = 0;
+
+function toWorld(p) {
+  return new THREE.Vector3(
+    (p.x - 0.5) * SCALE,
+    (0.5 - p.y) * SCALE,
+    -p.z * SCALE * 0.5
+  );
+}
+
+function isVis(p) { return p && (p.visibility === undefined || p.visibility >= VIS_THRESH); }
+
+function norm(v) {
+  const l = v.length();
+  return l > 1e-6 ? v.clone().divideScalar(l) : new THREE.Vector3(0, 1, 0);
+}
+
+function makeBasisQuat(x, y, z) {
+  const m = new THREE.Matrix4().makeBasis(x, y, z);
+  return new THREE.Quaternion().setFromRotationMatrix(m);
+}
+
+function calibrate(landmarks) {
+  const lSh = toWorld(landmarks[MP.LEFT_SHOULDER]);
+  const rSh = toWorld(landmarks[MP.RIGHT_SHOULDER]);
+  const lHi = toWorld(landmarks[MP.LEFT_HIP]);
+  const rHi = toWorld(landmarks[MP.RIGHT_HIP]);
+  const lEl = toWorld(landmarks[MP.LEFT_ELBOW]);
+  const rEl = toWorld(landmarks[MP.RIGHT_ELBOW]);
+  const lWr = toWorld(landmarks[MP.LEFT_WRIST]);
+  const rWr = toWorld(landmarks[MP.RIGHT_WRIST]);
+  const lKn = toWorld(landmarks[MP.LEFT_KNEE]);
+  const rKn = toWorld(landmarks[MP.RIGHT_KNEE]);
+  const lAn = toWorld(landmarks[MP.LEFT_ANKLE]);
+  const rAn = toWorld(landmarks[MP.RIGHT_ANKLE]);
+  const nose = toWorld(landmarks[MP.NOSE]);
+
+  const shoulderC = new THREE.Vector3().addVectors(lSh, rSh).multiplyScalar(0.5);
+  const hipC = new THREE.Vector3().addVectors(lHi, rHi).multiplyScalar(0.5);
+
+  const shoulderLine = norm(new THREE.Vector3().subVectors(lSh, rSh));
+  const hipLine = norm(new THREE.Vector3().subVectors(lHi, rHi));
+  const spineDir = norm(new THREE.Vector3().subVectors(shoulderC, hipC));
+
+  const spineZ = norm(new THREE.Vector3().crossVectors(shoulderLine, spineDir));
+  const hipZ = norm(new THREE.Vector3().crossVectors(hipLine, spineDir));
+
+  _calib = {
+    shoulderLine, hipLine, spineDir,
+    spineBasis: makeBasisQuat(shoulderLine, spineDir, spineZ),
+    hipBasis: makeBasisQuat(hipLine, spineDir, hipZ),
+    noseDir: norm(new THREE.Vector3().subVectors(nose, shoulderC)),
+    lArmDir: norm(new THREE.Vector3().subVectors(lEl, lSh)),
+    rArmDir: norm(new THREE.Vector3().subVectors(rEl, rSh)),
+    lForeDir: norm(new THREE.Vector3().subVectors(lWr, lEl)),
+    rForeDir: norm(new THREE.Vector3().subVectors(rWr, rEl)),
+    lLegDir: norm(new THREE.Vector3().subVectors(lKn, lHi)),
+    rLegDir: norm(new THREE.Vector3().subVectors(rKn, rHi)),
+    lShinDir: norm(new THREE.Vector3().subVectors(lAn, lKn)),
+    rShinDir: norm(new THREE.Vector3().subVectors(rAn, rKn)),
+  };
+
+  console.log('[Pose] 校准完成');
+  console.log('[Pose] spineDir:', spineDir.toArray().map(v => v.toFixed(3)));
+}
+
+export function isCalibrated() { return !!_calib; }
+export function resetCalibration() { _calib = null; resetFilters(); _debugCount = 0; }
+export function setMirrorMode(m) { _mirror = m; }
+export function getMirrorMode() { return _mirror; }
 
 // ═══════════════════════════════════════════════════════════
-//  骨骼求解
-//  MP left = MMD 右（摄像头镜像）
+//  求解器
 // ═══════════════════════════════════════════════════════════
 
-export function solvePoseToBones(landmarks, boneMap) {
-  _landmarks = landmarks;
+export function solvePoseToBones(landmarks, boneMap, restWorldQuats, timestamp) {
+  if (!landmarks || landmarks.length < 33) return {};
+
+  // 构建骨骼映射（带模糊匹配），缓存
+  if (!_boneMapCache || _boneMapCache._boneCount !== boneMap._boneCount) {
+    // boneMap 是从 main.js 传入的 {name: idx}，我们需要重建
+    // 实际上 main.js 传入的是简单映射，我们在这里用骨骼数组重建
+    // 但 main.js 传入的不是骨骼数组... 让我们直接用传入的 boneMap
+    _boneMapCache = boneMap;
+  }
+
+  if (!_calib) { calibrate(landmarks); }
+  if (!_calib) return {};
+
+  const t = timestamp || performance.now() / 1000;
+  const c = _calib;
   const results = {};
+  const targetWorldQ = {};
 
-  const nose = lm(MP.NOSE);
-  const lSh = lm(MP.LEFT_SHOULDER), rSh = lm(MP.RIGHT_SHOULDER);
-  const lEl = lm(MP.LEFT_ELBOW), rEl = lm(MP.RIGHT_ELBOW);
-  const lWr = lm(MP.LEFT_WRIST), rWr = lm(MP.RIGHT_WRIST);
-  const lHi = lm(MP.LEFT_HIP), rHi = lm(MP.RIGHT_HIP);
-  const lKn = lm(MP.LEFT_KNEE), rKn = lm(MP.RIGHT_KNEE);
-  const lAn = lm(MP.LEFT_ANKLE), rAn = lm(MP.RIGHT_ANKLE);
-
-  const shoulderC = avg(MP.LEFT_SHOULDER, MP.RIGHT_SHOULDER);
-  const hipC = avg(MP.LEFT_HIP, MP.RIGHT_HIP);
-
-  // ── 上半身：前倾/后仰 + 左右扭转 ──
-  if (shoulderC && hipC && boneMap['上半身'] !== undefined) {
-    // 前倾：肩相对于髋向前（z 增大）
-    const dz = shoulderC.z - hipC.z;
-    const leanX = clamp(dz * 3.0, -0.5, 0.5);
-
-    // 左右扭转：肩连线与髋连线的角度差
-    const shoulderAngle = lSh && rSh ? Math.atan2(lSh.y - rSh.y, lSh.x - rSh.x) : 0;
-    const hipAngle = lHi && rHi ? Math.atan2(lHi.y - rHi.y, lHi.x - rHi.x) : 0;
-    const twistY = clamp((shoulderAngle - hipAngle) * 0.5, -0.6, 0.6);
-
-    results['上半身'] = {
-      idx: boneMap['上半身'],
-      quat: quatFromEuler(smoothValue('上半身_x', leanX), smoothValue('上半身_y', twistY), 0),
-    };
-  }
-
-  // ── 首/頭：左右转头 + 点头 ──
-  if (nose && shoulderC) {
-    // 左右转头：鼻相对于肩中心的水平偏移
-    const dx = nose.x - shoulderC.x;
-    const shoulderWidth = lSh && rSh ? Math.abs(lSh.x - rSh.x) : 0.3;
-    const turnY = clamp(dx / shoulderWidth * 0.8, -0.8, 0.8);
-
-    // 点头：鼻相对于肩中心的垂直偏移
-    const dy = nose.y - shoulderC.y;
-    const nodX = clamp(-dy * 1.5, -0.5, 0.5);
-
-    if (boneMap['首'] !== undefined) {
-      results['首'] = {
-        idx: boneMap['首'],
-        quat: quatFromEuler(smoothValue('首_x', nodX), smoothValue('首_y', turnY), 0),
-      };
+  // ── 滤波 landmarks ──
+  const filters = ensureLmFilters();
+  const fl = [];
+  for (let i = 0; i < landmarks.length; i++) {
+    const p = landmarks[i];
+    if (!isVis(p)) {
+      if (filters[i]._fx._x !== null) {
+        fl.push({ x: filters[i]._fx._x, y: filters[i]._fy._x, z: filters[i]._fz._x, visibility: 0 });
+      } else {
+        fl.push(p);
+      }
+      continue;
     }
-    if (boneMap['頭'] !== undefined) {
-      results['頭'] = {
-        idx: boneMap['頭'],
-        quat: quatFromEuler(smoothValue('頭_x', nodX * 0.5), smoothValue('頭_y', turnY * 0.5), 0),
-      };
+    fl.push(filters[i].filter(p, t));
+  }
+
+  // ── 关键点 ──
+  const lSh = toWorld(fl[MP.LEFT_SHOULDER]);
+  const rSh = toWorld(fl[MP.RIGHT_SHOULDER]);
+  const lEl = toWorld(fl[MP.LEFT_ELBOW]);
+  const rEl = toWorld(fl[MP.RIGHT_ELBOW]);
+  const lWr = toWorld(fl[MP.LEFT_WRIST]);
+  const rWr = toWorld(fl[MP.RIGHT_WRIST]);
+  const lHi = toWorld(fl[MP.LEFT_HIP]);
+  const rHi = toWorld(fl[MP.RIGHT_HIP]);
+  const lKn = toWorld(fl[MP.LEFT_KNEE]);
+  const rKn = toWorld(fl[MP.RIGHT_KNEE]);
+  const lAn = toWorld(fl[MP.LEFT_ANKLE]);
+  const rAn = toWorld(fl[MP.RIGHT_ANKLE]);
+  const nose = toWorld(fl[MP.NOSE]);
+
+  const shoulderC = new THREE.Vector3().addVectors(lSh, rSh).multiplyScalar(0.5);
+  const hipC = new THREE.Vector3().addVectors(lHi, rHi).multiplyScalar(0.5);
+
+  // ── 当前方向 ──
+  const curSpineDir = norm(new THREE.Vector3().subVectors(shoulderC, hipC));
+  const curShoulderLine = norm(new THREE.Vector3().subVectors(lSh, rSh));
+  const curHipLine = norm(new THREE.Vector3().subVectors(lHi, rHi));
+
+  // ── 辅助函数：方向向量骨骼求解 ──
+  function solveDir(name, calibDir, curDir, parentName) {
+    if (boneMap[name] === undefined) return;
+    const delta = new THREE.Quaternion().setFromUnitVectors(calibDir, curDir);
+    const restW = restWorldQuats[name] || new THREE.Quaternion();
+    const tgtW = delta.clone().multiply(restW);
+    const parentTgtW = parentName ? (targetWorldQ[parentName] || restWorldQuats[parentName] || new THREE.Quaternion()) : new THREE.Quaternion();
+    const localQ = parentTgtW.clone().invert().multiply(tgtW);
+    results[name] = { idx: boneMap[name], quat: getQF(name).filter(localQ, t) };
+    targetWorldQ[name] = tgtW;
+  }
+
+  // ── 辅助函数：正交基骨骼求解 ──
+  function solveBasis(name, calibBasis, curBasis, parentName) {
+    if (boneMap[name] === undefined) return;
+    const delta = calibBasis.clone().invert().multiply(curBasis);
+    const restW = restWorldQuats[name] || new THREE.Quaternion();
+    const tgtW = delta.clone().multiply(restW);
+    const parentTgtW = parentName ? (targetWorldQ[parentName] || restWorldQuats[parentName] || new THREE.Quaternion()) : new THREE.Quaternion();
+    const localQ = parentTgtW.clone().invert().multiply(tgtW);
+    results[name] = { idx: boneMap[name], quat: getQF(name).filter(localQ, t) };
+    targetWorldQ[name] = tgtW;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  //  按骨骼层级顺序求解
+  // ═══════════════════════════════════════════════════════════
+
+  // ── 下半身 ──
+  const curHipZ = norm(new THREE.Vector3().crossVectors(curHipLine, curSpineDir));
+  const curHipBasis = makeBasisQuat(curHipLine, curSpineDir, curHipZ);
+  solveBasis('下半身', c.hipBasis, curHipBasis, null);
+
+  // ── 上半身 ──
+  const curSpineZ = norm(new THREE.Vector3().crossVectors(curShoulderLine, curSpineDir));
+  const curSpineBasis = makeBasisQuat(curShoulderLine, curSpineDir, curSpineZ);
+  solveBasis('上半身', c.spineBasis, curSpineBasis, '下半身');
+
+  // ── 首 ──
+  const curNoseDir = norm(new THREE.Vector3().subVectors(nose, shoulderC));
+  solveDir('首', c.noseDir, curNoseDir, '上半身');
+
+  // ── 頭 ──
+  if (boneMap['頭'] !== undefined) {
+    const neckLocalQ = results['首'] ? results['首'].quat : new THREE.Quaternion();
+    const headLocalQ = new THREE.Quaternion().slerpQuaternions(new THREE.Quaternion(), neckLocalQ, 0.5);
+    results['頭'] = { idx: boneMap['頭'], quat: getQF('頭').filter(headLocalQ, t) };
+    const parentTgtW = targetWorldQ['首'] || targetWorldQ['上半身'] || new THREE.Quaternion();
+    targetWorldQ['頭'] = parentTgtW.clone().multiply(headLocalQ);
+  }
+
+  // ── 四肢 ──
+  const R = _mirror; // true=镜像: MP left → MMD 右
+
+  // 右腕 = MP左臂（镜像）
+  solveDir('右腕', R ? c.lArmDir : c.rArmDir,
+    norm(new THREE.Vector3().subVectors(R ? lEl : rEl, R ? lSh : rSh)), '上半身');
+  // 左腕 = MP右臂（镜像）
+  solveDir('左腕', R ? c.rArmDir : c.lArmDir,
+    norm(new THREE.Vector3().subVectors(R ? rEl : lEl, R ? rSh : lSh)), '上半身');
+  // 右ひじ
+  solveDir('右ひじ', R ? c.lForeDir : c.rForeDir,
+    norm(new THREE.Vector3().subVectors(R ? lWr : rWr, R ? lEl : rEl)), '右腕');
+  // 左ひじ
+  solveDir('左ひじ', R ? c.rForeDir : c.lForeDir,
+    norm(new THREE.Vector3().subVectors(R ? rWr : lWr, R ? rEl : lEl)), '左腕');
+
+  // 右足 = MP左腿（镜像）
+  solveDir('右足', R ? c.lLegDir : c.rLegDir,
+    norm(new THREE.Vector3().subVectors(R ? lKn : rKn, R ? lHi : rHi)), '下半身');
+  // 左足 = MP右腿（镜像）
+  solveDir('左足', R ? c.rLegDir : c.lLegDir,
+    norm(new THREE.Vector3().subVectors(R ? rKn : lKn, R ? rHi : lHi)), '下半身');
+  // 右ひざ
+  solveDir('右ひざ', R ? c.lShinDir : c.rShinDir,
+    norm(new THREE.Vector3().subVectors(R ? lAn : rAn, R ? lKn : rKn)), '右足');
+  // 左ひざ
+  solveDir('左ひざ', R ? c.rShinDir : c.lShinDir,
+    norm(new THREE.Vector3().subVectors(R ? rAn : lAn, R ? rKn : lKn)), '左足');
+
+  // 足首保持 rest
+  if (boneMap['右足首'] !== undefined) {
+    const restLocal = restWorldQuats['右足首'] ? (targetWorldQ['右ひざ'] ?
+      targetWorldQ['右ひざ'].clone().invert().multiply(restWorldQuats['右足首']) : new THREE.Quaternion()) : new THREE.Quaternion();
+    results['右足首'] = { idx: boneMap['右足首'], quat: getQF('右足首').filter(restLocal, t) };
+  }
+  if (boneMap['左足首'] !== undefined) {
+    const restLocal = restWorldQuats['左足首'] ? (targetWorldQ['左ひざ'] ?
+      targetWorldQ['左ひざ'].clone().invert().multiply(restWorldQuats['左足首']) : new THREE.Quaternion()) : new THREE.Quaternion();
+    results['左足首'] = { idx: boneMap['左足首'], quat: getQF('左足首').filter(restLocal, t) };
+  }
+
+  // ── 调试日志（前5帧） ──
+  if (_debugCount < 5) {
+    _debugCount++;
+    const solved = Object.keys(results);
+    const allExpected = ['下半身', '上半身', '首', '頭', '右腕', '左腕', '右ひじ', '左ひじ', '右足', '左足', '右ひざ', '左ひざ'];
+    const missing = allExpected.filter(n => boneMap[n] === undefined);
+    console.log(`[Pose] 帧${_debugCount}: 求解 ${solved.length} 骨骼: ${solved.join(', ')}`);
+    if (missing.length) console.warn(`[Pose] 模型缺少骨骼: ${missing.join(', ')}`);
+    if (_debugCount === 1 && boneMap['下半身'] !== undefined) {
+      const restW = restWorldQuats['下半身'];
+      console.log('[Pose] 下半身 restWorldQuat:', restW ? [restW.x.toFixed(3), restW.y.toFixed(3), restW.z.toFixed(3), restW.w.toFixed(3)] : 'null');
     }
   }
 
-  // ── 右腕（MMD右 = MP左）：左肩→左肘 ──
-  // 大臂：Z轴旋转 = 手臂在身体平面内的角度（侧抬）
-  //       X轴旋转 = 前后摆动（用 z 深度）
-  if (lSh && lEl && boneMap['右腕'] !== undefined) {
-    // 侧抬角度：0=下垂, π/2=水平侧抬
-    const sideAngle = angleFromDown(lSh, lEl);
-    // 映射到 Z 轴：MMD 右臂侧抬 = 负 Z 旋转（右手系）
-    const rz = clamp(-sideAngle, -Math.PI * 0.9, Math.PI * 0.9);
-
-    // 前后摆动：肘相对于肩的 z 差
-    const dz = lEl.z - lSh.z;
-    const rx = clamp(dz * 2.5, -1.2, 1.2);
-
-    results['右腕'] = {
-      idx: boneMap['右腕'],
-      quat: quatFromEuler(smoothValue('右腕_x', rx), 0, smoothValue('右腕_z', rz)),
-    };
-  }
-
-  // ── 左腕（MMD左 = MP右）：右肩→右肘 ──
-  if (rSh && rEl && boneMap['左腕'] !== undefined) {
-    const sideAngle = angleFromDown(rSh, rEl);
-    // 左臂侧抬 = 正 Z 旋转
-    const rz = clamp(sideAngle, -Math.PI * 0.9, Math.PI * 0.9);
-
-    const dz = rEl.z - rSh.z;
-    const rx = clamp(dz * 2.5, -1.2, 1.2);
-
-    results['左腕'] = {
-      idx: boneMap['左腕'],
-      quat: quatFromEuler(smoothValue('左腕_x', rx), 0, smoothValue('左腕_z', rz)),
-    };
-  }
-
-  // ── 右ひじ（MMD右 = MP左）：左肘→左腕 ──
-  // 小臂弯曲：大臂与小臂的夹角
-  if (lEl && lWr && lSh && boneMap['右ひじ'] !== undefined) {
-    // 大臂方向
-    const armDx = lEl.x - lSh.x, armDy = lEl.y - lSh.y;
-    // 小臂方向
-    const foreDx = lWr.x - lEl.x, foreDy = lWr.y - lEl.y;
-    // 两向量夹角
-    const armLen = Math.hypot(armDx, armDy) || 1;
-    const foreLen = Math.hypot(foreDx, foreDy) || 1;
-    const dot = (armDx * foreDx + armDy * foreDy) / (armLen * foreLen);
-    const angle = Math.acos(clamp(dot, -1, 1));
-    // 弯曲角度：伸直=0, 弯曲=π
-    // 映射到 X 轴旋转（小臂向内弯）
-    const rx = clamp((Math.PI - angle) * 0.8, 0, 2.0);
-
-    results['右ひじ'] = {
-      idx: boneMap['右ひじ'],
-      quat: quatFromEuler(smoothValue('右ひじ_x', rx), 0, 0),
-    };
-  }
-
-  // ── 左ひじ（MMD左 = MP右）：右肘→右腕 ──
-  if (rEl && rWr && rSh && boneMap['左ひじ'] !== undefined) {
-    const armDx = rEl.x - rSh.x, armDy = rEl.y - rSh.y;
-    const foreDx = rWr.x - rEl.x, foreDy = rWr.y - rEl.y;
-    const armLen = Math.hypot(armDx, armDy) || 1;
-    const foreLen = Math.hypot(foreDx, foreDy) || 1;
-    const dot = (armDx * foreDx + armDy * foreDy) / (armLen * foreLen);
-    const angle = Math.acos(clamp(dot, -1, 1));
-    const rx = clamp((Math.PI - angle) * 0.8, 0, 2.0);
-
-    results['左ひじ'] = {
-      idx: boneMap['左ひじ'],
-      quat: quatFromEuler(smoothValue('左ひじ_x', rx), 0, 0),
-    };
-  }
-
-  // ── 右足（MMD右 = MP左）：左髋→左膝 ──
-  if (lHi && lKn && boneMap['右足'] !== undefined) {
-    // 前后抬腿：角度
-    const legAngle = angleFromDown(lHi, lKn);
-    // 映射到 X 轴旋转
-    const rx = clamp(-legAngle, -1.0, 1.0);
-
-    results['右足'] = {
-      idx: boneMap['右足'],
-      quat: quatFromEuler(smoothValue('右足_x', rx), 0, 0),
-    };
-  }
-
-  // ── 左足（MMD左 = MP右）：右髋→右膝 ──
-  if (rHi && rKn && boneMap['左足'] !== undefined) {
-    const legAngle = angleFromDown(rHi, rKn);
-    const rx = clamp(legAngle, -1.0, 1.0);
-
-    results['左足'] = {
-      idx: boneMap['左足'],
-      quat: quatFromEuler(smoothValue('左足_x', rx), 0, 0),
-    };
-  }
-
-  // ── 右ひざ（MMD右 = MP左）：左膝→左踝 ──
-  if (lKn && lAn && lHi && boneMap['右ひざ'] !== undefined) {
-    const thighDx = lKn.x - lHi.x, thighDy = lKn.y - lHi.y;
-    const shinDx = lAn.x - lKn.x, shinDy = lAn.y - lKn.y;
-    const tLen = Math.hypot(thighDx, thighDy) || 1;
-    const sLen = Math.hypot(shinDx, shinDy) || 1;
-    const dot = (thighDx * shinDx + thighDy * shinDy) / (tLen * sLen);
-    const angle = Math.acos(clamp(dot, -1, 1));
-    const rx = clamp((Math.PI - angle) * 0.7, 0, 1.8);
-
-    results['右ひざ'] = {
-      idx: boneMap['右ひざ'],
-      quat: quatFromEuler(smoothValue('右ひざ_x', rx), 0, 0),
-    };
-  }
-
-  // ── 左ひざ（MMD左 = MP右）：右膝→右踝 ──
-  if (rKn && rAn && rHi && boneMap['左ひざ'] !== undefined) {
-    const thighDx = rKn.x - rHi.x, thighDy = rKn.y - rHi.y;
-    const shinDx = rAn.x - rKn.x, shinDy = rAn.y - rKn.y;
-    const tLen = Math.hypot(thighDx, thighDy) || 1;
-    const sLen = Math.hypot(shinDx, shinDy) || 1;
-    const dot = (thighDx * shinDx + thighDy * shinDy) / (tLen * sLen);
-    const angle = Math.acos(clamp(dot, -1, 1));
-    const rx = clamp((Math.PI - angle) * 0.7, 0, 1.8);
-
-    results['左ひざ'] = {
-      idx: boneMap['左ひざ'],
-      quat: quatFromEuler(smoothValue('左ひざ_x', rx), 0, 0),
-    };
-  }
-
-  _landmarks = null;
   return results;
+}
+
+/**
+ * 构建骨骼映射表（带模糊匹配）
+ * @param {Array} bones - mesh.skeleton.bones
+ * @returns {Object} { standardName: boneIndex }
+ */
+export function buildPoseBoneMap(bones) {
+  const map = buildBoneMap(bones);
+  console.log('[Pose] 骨骼映射:', Object.fromEntries(
+    Object.entries(map).map(([k, v]) => [k, `${v}(${bones[v].name})`])
+  ));
+  return map;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -276,18 +391,10 @@ let _poseLandmarker = null;
 
 async function ensurePoseLandmarker() {
   if (_poseLandmarker) return _poseLandmarker;
-
-  console.log('[Pose] 开始加载 @mediapipe/tasks-vision...');
   const { PoseLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision');
-  console.log('[Pose] tasks-vision 模块已加载');
-
-  console.log('[Pose] 加载 WASM 运行时...');
   const vision = await FilesetResolver.forVisionTasks(
     'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
   );
-  console.log('[Pose] WASM 运行时已加载');
-
-  console.log('[Pose] 下载姿态检测模型...');
   _poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
     baseOptions: {
       modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
@@ -296,7 +403,6 @@ async function ensurePoseLandmarker() {
     runningMode: 'VIDEO',
     numPoses: 1,
   });
-
   console.log('[Pose] PoseLandmarker 初始化完成');
   return _poseLandmarker;
 }
@@ -306,18 +412,14 @@ export async function initPoseCapture(videoEl, onResults, onStatus) {
 
   status('加载姿态检测模型...');
   let landmarker;
-  try {
-    landmarker = await ensurePoseLandmarker();
-  } catch (err) {
-    throw new Error('MediaPipe 初始化失败: ' + (err.message || err));
-  }
+  try { landmarker = await ensurePoseLandmarker(); }
+  catch (err) { throw new Error('MediaPipe 初始化失败: ' + (err.message || err)); }
 
   status('打开摄像头...');
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 640 }, height: { ideal: 480 } },
-      audio: false,
+      video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: false,
     });
   } catch (err) {
     if (err.name === 'NotAllowedError') throw new Error('摄像头权限被拒绝');
@@ -327,62 +429,51 @@ export async function initPoseCapture(videoEl, onResults, onStatus) {
   }
 
   videoEl.srcObject = stream;
-  await new Promise((resolve) => { videoEl.onloadedmetadata = resolve; });
+  await new Promise(r => { videoEl.onloadedmetadata = r; });
   await videoEl.play();
-  await new Promise((resolve) => {
-    if (videoEl.readyState >= 2) { resolve(); return; }
-    videoEl.onloadeddata = resolve;
-  });
+  await new Promise(r => { if (videoEl.readyState >= 2) r(); else videoEl.onloadeddata = r; });
 
   console.log('[Pose] 摄像头已启动:', videoEl.videoWidth, 'x', videoEl.videoHeight);
   status('摄像头已启动，开始检测...');
 
   let running = true;
-  let lastTimestamp = -1;
+  let lastTs = -1;
 
-  async function detect() {
+  function detect() {
     if (!running) return;
-
     if (videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
       const now = performance.now();
-      if (now > lastTimestamp) {
-        lastTimestamp = now;
+      if (now > lastTs) {
+        lastTs = now;
         try {
           const result = landmarker.detectForVideo(videoEl, Math.floor(now));
           if (result.landmarks && result.landmarks.length > 0) {
-            const landmarks = result.landmarks[0].map(lm => ({
+            onResults(result.landmarks[0].map(lm => ({
               x: lm.x, y: lm.y, z: lm.z, visibility: lm.visibility || 1,
-            }));
-            onResults(landmarks);
+            })));
           } else {
             onResults(null);
           }
         } catch (e) { /* skip */ }
       }
     }
-
     if (running) requestAnimationFrame(detect);
   }
-
   requestAnimationFrame(detect);
 
   return {
-    landmarker,
-    videoEl,
     stop: () => {
       running = false;
-      stream.getTracks().forEach((t) => t.stop());
-      resetSmoothing();
+      stream.getTracks().forEach(t => t.stop());
+      resetFilters();
+      resetCalibration();
+      _boneMapCache = null;
     },
   };
 }
 
-/**
- * 在 canvas 上绘制视频画面 + 骨骼连线
- */
 export function drawPoseCanvas(ctx, landmarks, w, h, videoEl) {
   ctx.clearRect(0, 0, w, h);
-
   if (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
     ctx.save();
     ctx.translate(w, 0);
@@ -390,34 +481,22 @@ export function drawPoseCanvas(ctx, landmarks, w, h, videoEl) {
     ctx.drawImage(videoEl, 0, 0, w, h);
     ctx.restore();
   }
-
   if (!landmarks) return;
-
-  const connections = [
-    [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
-    [11, 23], [12, 24], [23, 24],
-    [23, 25], [25, 27], [24, 26], [26, 28],
-  ];
-
-  const mx = (lm) => lm ? (1 - lm.x) * w : 0;
-  const my = (lm) => lm ? lm.y * h : 0;
-
-  ctx.strokeStyle = '#7c5cfc';
-  ctx.lineWidth = 3;
+  const conns = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
+  const mx = l => l ? (1 - l.x) * w : 0;
+  const my = l => l ? l.y * h : 0;
+  ctx.strokeStyle = '#7c5cfc'; ctx.lineWidth = 3;
   ctx.beginPath();
-  for (const [a, b] of connections) {
+  for (const [a, b] of conns) {
     if (!landmarks[a] || !landmarks[b]) continue;
     ctx.moveTo(mx(landmarks[a]), my(landmarks[a]));
     ctx.lineTo(mx(landmarks[b]), my(landmarks[b]));
   }
   ctx.stroke();
-
   ctx.fillStyle = '#f09393';
   for (let i = 0; i < landmarks.length; i++) {
-    const lm = landmarks[i];
-    if (!lm || (lm.visibility !== undefined && lm.visibility < 0.3)) continue;
-    ctx.beginPath();
-    ctx.arc(mx(lm), my(lm), 4, 0, Math.PI * 2);
-    ctx.fill();
+    const l = landmarks[i];
+    if (!l || (l.visibility !== undefined && l.visibility < VIS_THRESH)) continue;
+    ctx.beginPath(); ctx.arc(mx(l), my(l), 4, 0, Math.PI * 2); ctx.fill();
   }
 }

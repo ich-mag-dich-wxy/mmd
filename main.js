@@ -4,7 +4,7 @@ import { MMDLoader } from 'three/addons/loaders/MMDLoader.js';
 import { MMDAnimationHelper } from 'three/addons/animation/MMDAnimationHelper.js';
 import { createAvatar } from './src/core/avatarCore.js';
 import { vmdToText, textToVMD, createDirectAnimationClip, downloadVMD } from './src/core/vmdDecompiler.js';
-import { initPoseCapture, solvePoseToBones, drawPoseCanvas } from './src/core/poseCapture.js';
+import { initPoseCapture, solvePoseToBones, drawPoseCanvas, resetCalibration, setMirrorMode, getMirrorMode, isCalibrated, buildPoseBoneMap } from './src/core/poseCapture.js';
 import { VMDRecorder, saveRecording, saveSnapshot } from './src/core/vmdRecorder.js';
 
 const state = {
@@ -28,6 +28,8 @@ const state = {
   poseCapture: null,
   poseActive: false,
   poseLandmarks: null,
+  poseRestQuats: {},          // 骨骼 rest 局部四元数
+  poseRestWorldQuats: {},     // 骨骼 rest 世界四元数（预计算）
   // 录制/快照
   recorder: null,
   isRecording: false,
@@ -330,12 +332,11 @@ function handleFolderUpload(files) {
 function applyPoseToMesh(landmarks) {
   if (!state.mesh || !state.mesh.skeleton) return;
 
+  // 使用模糊匹配构建骨骼映射
+  const boneMap = buildPoseBoneMap(state.mesh.skeleton.bones);
+  const poseData = solvePoseToBones(landmarks, boneMap, state.poseRestWorldQuats);
+
   const bones = state.mesh.skeleton.bones;
-  const boneMap = {};
-  for (let i = 0; i < bones.length; i++) boneMap[bones[i].name] = i;
-
-  const poseData = solvePoseToBones(landmarks, boneMap);
-
   for (const boneName in poseData) {
     const data = poseData[boneName];
     const bone = bones[data.idx];
@@ -355,6 +356,22 @@ function applyPoseToMesh(landmarks) {
   }
 }
 
+/**
+ * 预计算每个骨骼的 rest 世界四元数
+ * 关键：用 bone.getWorldQuaternion() 获取真实的世界旋转
+ */
+function computeRestWorldQuats(mesh) {
+  mesh.updateMatrixWorld(true);
+  const bones = mesh.skeleton.bones;
+  const result = {};
+  for (let i = 0; i < bones.length; i++) {
+    const q = new THREE.Quaternion();
+    bones[i].getWorldQuaternion(q);
+    result[bones[i].name] = q;
+  }
+  return result;
+}
+
 function animate() {
   requestAnimationFrame(animate);
   const delta = state.clock.getDelta();
@@ -369,7 +386,7 @@ function animate() {
       state.helper.update(delta);
     }
 
-    // 持续绘制摄像头预览（即使没有检测结果也画视频画面）
+    // 持续绘制摄像头预览（使用归一化坐标）
     if (state.poseActive && state.poseCapture) {
       const canvasEl = $('#pose-canvas');
       const videoEl = $('#pose-video');
@@ -464,6 +481,29 @@ $('#btn-record').addEventListener('click', () => {
 });
 
 $('#btn-snapshot').addEventListener('click', takeSnapshot);
+
+$('#btn-calibrate').addEventListener('click', () => {
+  if (!state.poseActive) {
+    editorStatus.textContent = '⚠️ 请先启动摄像头';
+    return;
+  }
+  resetCalibration();
+  // 重新记录 rest pose
+  state.poseRestQuats = {};
+  const bones = state.mesh.skeleton.bones;
+  for (let i = 0; i < bones.length; i++) {
+    state.poseRestQuats[bones[i].name] = bones[i].quaternion.clone();
+  }
+  state.poseRestWorldQuats = computeRestWorldQuats(state.mesh);
+  editorStatus.textContent = '🎯 校准完成，开始动作捕捉';
+});
+
+$('#btn-mirror').addEventListener('click', () => {
+  const newMode = !getMirrorMode();
+  setMirrorMode(newMode);
+  $('#btn-mirror').textContent = newMode ? '🪞 镜像' : '🎭 木偶';
+  editorStatus.textContent = newMode ? '🪞 镜像模式：抬右手→模型左手' : '🎭 木偶模式：抬右手→模型右手';
+});
 
 $('#pose-close').addEventListener('click', () => {
   if (state.poseActive) stopCamera();
@@ -606,27 +646,49 @@ async function startCamera() {
   const canvasEl = $('#pose-canvas');
   const ctx = canvasEl.getContext('2d');
 
+  // ★ 关键：先停止所有动画，重置骨骼到 rest pose，再计算 restWorldQuats
+  if (state.avatar) {
+    state.avatar.stopAllAnimations();
+    state.avatar._vmdMode = false;
+    state.avatar._vmdModePureJS = false;
+  }
+  try { state.helper.remove(state.mesh); } catch(e) {}
+
+  // 手动重置所有骨骼到 rest pose
+  const bones = state.mesh.skeleton.bones;
+  if (state.avatar && state.avatar._boneRest) {
+    for (let i = 0; i < bones.length; i++) {
+      if (state.avatar._boneRest[i]) {
+        bones[i].quaternion.copy(state.avatar._boneRest[i]);
+      }
+      if (state.avatar._boneRestPos[i]) {
+        bones[i].position.copy(state.avatar._boneRestPos[i]);
+      }
+    }
+  }
+  state.mesh.updateMatrixWorld(true);
+
+  // 现在骨骼在真正的 rest pose，计算 rest 数据
+  state.poseRestQuats = {};
+  for (let i = 0; i < bones.length; i++) {
+    state.poseRestQuats[bones[i].name] = bones[i].quaternion.clone();
+  }
+  state.poseRestWorldQuats = computeRestWorldQuats(state.mesh);
+  console.log('[Pose] restWorldQuats 已计算, 骨骼数:', Object.keys(state.poseRestWorldQuats).length);
+
   try {
     editorStatus.textContent = '正在加载姿态检测模型（首次需下载，约10秒）...';
 
     state.poseCapture = await initPoseCapture(videoEl, (results) => {
       state.poseLandmarks = results;
-      drawPoseCanvas(ctx, state.poseLandmarks, canvasEl.width, canvasEl.height, videoEl);
     }, (msg) => {
       editorStatus.textContent = '📷 ' + msg;
     });
     state.poseActive = true;
 
-    // 停止 VMD 动画
-    if (state.avatar) {
-      state.avatar.stopAllAnimations();
-      state.avatar._vmdMode = false;
-    }
-    try { state.helper.remove(state.mesh); } catch(e) {}
-
     $('#pose-panel').classList.add('active');
     $('#btn-camera').textContent = '⏹ 停止';
-    editorStatus.textContent = '📷 摄像头已启动，动作捕捉中';
+    editorStatus.textContent = '📷 摄像头已启动，站直后点击「🎯 校准」';
   } catch (err) {
     editorStatus.textContent = `❌ 摄像头启动失败: ${err.message}`;
     console.error('[Pose] 启动失败:', err);

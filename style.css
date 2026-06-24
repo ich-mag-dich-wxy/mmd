@@ -439,6 +439,18 @@ body {
   border: none;
 }
 
+.calibrate-btn {
+  background: linear-gradient(135deg, #43cea2, #185a9d);
+  color: #fff;
+  border: none;
+}
+
+.mirror-btn {
+  background: linear-gradient(135deg, #8e2de2, #4a00e0);
+  color: #fff;
+  border: none;
+}
+
 .record-btn {
   background: linear-gradient(135deg, #e74c3c, #c0392b);
   color: #fff;
