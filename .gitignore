@@ -30,11 +30,6 @@ Thumbs.db
 # WASM cache
 .wasm-cache/
 
-# Models (too large to commit)
-public/models/
-public/*.wasm.js
-public/*.wasm.wasm
-
 # Sub-projects (not part of core)
 unity-project/
 vrm-tool/
