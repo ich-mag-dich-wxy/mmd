@@ -1,45 +1,69 @@
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { MMDLoader } from 'three/addons/loaders/MMDLoader.js';
-import { MMDAnimationHelper } from 'three/addons/animation/MMDAnimationHelper.js';
-import { createAvatar } from './src/core/avatarCore.js';
-import { vmdToText, textToVMD, createDirectAnimationClip, downloadVMD } from './src/core/vmdDecompiler.js';
-import { initPoseCapture, solvePoseToBones, drawPoseCanvas, resetCalibration, setMirrorMode, getMirrorMode, isCalibrated, buildPoseBoneMap } from './src/core/poseCapture.js';
-import { VMDRecorder, saveRecording, saveSnapshot } from './src/core/vmdRecorder.js';
+// ═══════════════════════════════════════════════════════════
+//  MMD Studio — 控制面板（Electron 渲染进程）
+//
+//  职责：
+//    - UI 交互（按钮、侧边栏、文件夹选择）
+//    - 摄像头动捕预览（PoseCaptureSystem 在这里运行）
+//    - 通过 IPC 指挥模型窗口（viewer）执行 3D 操作
+//
+//  与原 main.js 的差异：
+//    - 无 three.js 场景（所有 3D 逻辑移到 viewer.js）
+//    - 文件夹选择改用 Electron dialog（不再用 webkitdirectory）
+//    - 模型加载通过 IPC 发路径给 viewer，viewer 自己读文件
+//    - 动捕 landmarks 在这里采集，通过 IPC 实时传给 viewer
+// ═══════════════════════════════════════════════════════════
+
+import { vmdToText, downloadVMD } from './src/core/vmdDecompiler.js';
+import { compileMPLToVMD, isMPLScript } from './src/core/mplCompiler.js';
+import { drawPoseCanvas, resetCalibration, setMirrorMode, getMirrorMode } from './src/core/poseCapture.js';
+import { PoseCaptureSystem } from './src/core/poseCaptureSystem.js';
+import { VMDRecorder, saveRecording } from './src/core/vmdRecorder.js';
+import { AI_SYSTEM_PROMPT } from './src/core/aiPrompt.js';
+import './style.css';  // vite 通过 JS 注入 CSS（支持 HMR）
+
+// ═══════════════════════════════════════════════════════════
+//  状态
+// ═══════════════════════════════════════════════════════════
 
 const state = {
-  mesh: null,
-  avatar: null,
-  helper: new MMDAnimationHelper(),
-  clock: new THREE.Clock(),
+  // 资源库
+  modelLibrary: [],   // [{ id, name, pmxPath, textureFiles, folderName, size }]
+  motionLibrary: [],  // [{ id, name, type, path, folderName, size, text }]
+  // 当前活动模型/动作
+  activeModelId: null,
+  activeMotionId: null,
+  // 播放
   isPlaying: true,
-  animation: null,
-  ammoReady: false,
-  modelName: '',
-  motionName: '',
-  textureUrlMap: {},
-  fileCache: {},
-  folderName: '',
-  vmdArrayBuffer: null,
-  vmdFileName: '',
-  mplFileText: null,
-  mplFileName: '',
-  // 摄像头动作捕捉
+  motionFilter: 'all',
+  // 动捕（在控制面板运行，landmarks 传给 viewer）
   poseCapture: null,
   poseActive: false,
   poseLandmarks: null,
-  poseRestQuats: {},          // 骨骼 rest 局部四元数
-  poseRestWorldQuats: {},     // 骨骼 rest 世界四元数（预计算）
-  // 录制/快照
+  // 编译/反编译
+  mplFileText: null,
+  mplFileName: '',
+  vmdArrayBuffer: null,
+  vmdFileName: '',
+  // 录制
   recorder: null,
   isRecording: false,
+  // viewer 窗口状态
+  viewerOpened: false,
+  // AI 对话
+  aiMessages: [],     // OpenAI 格式: [{role, content}]
+  aiBusy: false,
 };
 
+let _modelIdCounter = 0;
+let _motionIdCounter = 0;
+const nextModelId = () => 'm' + (++_modelIdCounter);
+const nextMotionId = () => 'v' + (++_motionIdCounter);
+
 const $ = (sel) => document.querySelector(sel);
-const container = $('#scene-container');
+const $$ = (sel) => document.querySelectorAll(sel);
+
 const loadingOverlay = $('#loading-overlay');
 const loadingText = $('#loading-text');
-const dropZone = $('#drop-zone');
 const editorStatus = $('#editor-status');
 const progressEl = $('#editor-progress');
 const progressFill = $('#progress-fill');
@@ -51,646 +75,266 @@ function showProgress(phase, current, total) {
   const label = phase === 'bone' ? '骨骼' : phase === 'morph' ? '形变' : phase;
   progressText.textContent = `${label} ${current.toLocaleString()} / ${total.toLocaleString()} (${pct}%)`;
 }
-
-function startProgress() {
-  progressEl.classList.add('active');
-  progressFill.style.width = '0%';
-  progressText.textContent = '';
-}
-
-function endProgress() {
-  progressEl.classList.remove('active');
-  progressFill.style.width = '0%';
-}
-
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x2a2a3a);
-
-const camera = new THREE.PerspectiveCamera(22, container.clientWidth / container.clientHeight, 1, 3000);
-camera.position.set(0, 22, 70);
-
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setSize(container.clientWidth, container.clientHeight);
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.2;
-container.appendChild(renderer.domElement);
-
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 15, 0);
-controls.enableDamping = true;
-controls.dampingFactor = 0.05;
-controls.minDistance = 5;
-controls.maxDistance = 300;
-controls.update();
-
-scene.add(new THREE.AmbientLight(0x404060, 0.6));
-scene.add(new THREE.HemisphereLight(0xadd8e6, 0x333333, 0.8));
-const mLight = new THREE.DirectionalLight(0xffeedd, 2.0);
-mLight.position.set(10, 20, 10);
-scene.add(mLight);
-const fLight = new THREE.DirectionalLight(0x8888ff, 0.6);
-fLight.position.set(-10, 5, -10);
-scene.add(fLight);
-const rLight = new THREE.DirectionalLight(0xffffff, 0.5);
-rLight.position.set(0, -5, 15);
-scene.add(rLight);
-
-const grid = new THREE.GridHelper(40, 20, 0x8888ff, 0x444466);
-grid.position.y = 0;
-scene.add(grid);
-
-window.addEventListener('resize', () => {
-  camera.aspect = container.clientWidth / container.clientHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(container.clientWidth, container.clientHeight);
-});
-
+function startProgress() { progressEl.classList.add('active'); progressFill.style.width = '0%'; progressText.textContent = ''; }
+function endProgress() { progressEl.classList.remove('active'); progressFill.style.width = '0%'; }
+function setStatus(msg) { editorStatus.textContent = msg; }
 function showLoading(msg) { loadingText.textContent = msg; loadingOverlay.classList.add('active'); }
 function hideLoading() { loadingOverlay.classList.remove('active'); }
 
-async function initAmmo() {
-  showLoading('初始化物理引擎...');
-  try {
-    if (typeof Ammo !== 'undefined') {
-      await Ammo();
-      state.ammoReady = true;
-    }
-  } catch (e) {
-    console.warn('[MMD] 物理引擎不可用:', e);
+// ═══════════════════════════════════════════════════════════
+//  IPC 通信辅助
+// ═══════════════════════════════════════════════════════════
+
+const api = window.electronAPI;
+
+// 发送指令到 viewer
+function sendToViewer(channel, payload) {
+  if (api && api.sendToViewer) {
+    api.sendToViewer(channel, payload);
   }
-  hideLoading();
 }
 
-function buildTextureUrlMap(filesArray) {
-  const exts = ['.png', '.jpg', '.jpeg', '.bmp', '.tga', '.dds', '.tif', '.tiff', '.gif'];
-  const map = {};
-  for (const file of filesArray) {
-    const ext = '.' + file.name.split('.').pop().toLowerCase();
-    if (!exts.includes(ext)) continue;
-    const blobUrl = URL.createObjectURL(file);
-    const relPath = file.webkitRelativePath ? file.webkitRelativePath.replace(/\\/g, '/') : file.name;
-    map[relPath.toLowerCase()] = blobUrl;
-    map[file.name.toLowerCase()] = blobUrl;
-    const parts = relPath.split('/');
-    if (parts.length > 1) map[parts.slice(1).join('/').toLowerCase()] = blobUrl;
+// 确保 viewer 窗口已打开
+async function ensureViewerOpen() {
+  if (state.viewerOpened) return;
+  if (api && api.openViewer) {
+    await api.openViewer();
+    state.viewerOpened = true;
   }
-  return map;
 }
 
-function patchMMDLoader(loader) {
-  const mb = loader.meshBuilder.materialBuilder;
-  const origLoadTexture = mb._loadTexture.bind(mb);
-  mb._loadTexture = function (filePath, textures, params, onProgress, onError) {
-    params = params || {};
-    if (params.isDefaultToonTexture) return origLoadTexture(filePath, textures, params, onProgress, onError);
-    const np = filePath.replace(/\\/g, '/').toLowerCase();
-    const fn = np.split('/').pop();
-    const candidates = [np, fn, state.folderName ? state.folderName + '/' + np : null, state.folderName ? state.folderName + '/' + fn : null].filter(Boolean);
-    for (const c of candidates) {
-      if (state.textureUrlMap[c]) {
-        const blobUrl = state.textureUrlMap[c];
-        const savedPath = this.resourcePath;
-        this.resourcePath = '';
-        const wrappedOnError = onError || (() => {});
-        const result = origLoadTexture(blobUrl, textures, params, onProgress, wrappedOnError);
-        this.resourcePath = savedPath;
-        return result;
+// 接收 viewer 回传的状态
+if (api && api.onViewerState) {
+  api.onViewerState((viewerState) => {
+    if (viewerState.type === 'model-loaded') {
+      state.activeModelId = viewerState.id;
+      hideLoading();
+      updateModelListUI();
+      updateInfoChips();
+      setStatus(`模型已加载: ${viewerState.name || ''}`);
+    } else if (viewerState.type === 'model-unloaded') {
+      if (state.activeModelId === viewerState.id) {
+        state.activeModelId = null;
       }
-    }
-    return origLoadTexture(filePath, textures, params, onProgress, onError || (() => {}));
-  };
-  return loader;
-}
-
-async function loadMMD() {
-  const modelFile = state.fileCache['model'];
-  if (!modelFile) {
-    loadingText.textContent = '请先选择 PMX 模型文件';
-    setTimeout(hideLoading, 1500);
-    return;
-  }
-
-  if (state.mesh) {
-    state.helper.remove(state.mesh);
-    scene.remove(state.mesh);
-    state.mesh = null;
-    state.avatar = null;
-  }
-  state.animation = null;
-
-  showLoading('构建纹理映射表...');
-  state.textureUrlMap = buildTextureUrlMap(Object.values(state.fileCache));
-  showLoading('加载 3D 模型中...');
-
-  let modelUrl = null;
-  try {
-    const modelBuffer = await modelFile.arrayBuffer();
-    const loader = patchMMDLoader(new MMDLoader());
-    loader.setResourcePath('/');
-    const modelBlob = new Blob([modelBuffer], { type: 'application/octet-stream' });
-    modelUrl = URL.createObjectURL(modelBlob);
-
-    const motionFile = state.fileCache['motion'];
-    const cameraFile = state.fileCache['camera'];
-
-    if (motionFile) {
-      const motionBuffer = await motionFile.arrayBuffer();
-      state.vmdArrayBuffer = motionBuffer.slice(0);
-      state.vmdFileName = motionFile.name;
-      const motionBlob = new Blob([motionBuffer], { type: 'application/octet-stream' });
-      const motionUrl = URL.createObjectURL(motionBlob);
-      const result = await new Promise((res, rej) =>
-        loader.loadWithAnimation(modelUrl, motionUrl, (m) => res(m), null, (e) => rej(e))
-      );
-      state.mesh = result.mesh;
-      state.animation = result.animation;
-      scene.add(state.mesh);
-      state.helper.add(state.mesh, {
-        animation: state.animation,
-        physics: false,
-      });
-      URL.revokeObjectURL(motionUrl);
-    } else {
-      state.mesh = await new Promise((res, rej) =>
-        loader.load(modelUrl, (m) => res(m), null, rej)
-      );
-      scene.add(state.mesh);
-    }
-
-    await new Promise((r) => setTimeout(r, 100));
-    if (state.mesh.skeleton && state.mesh.skeleton.bones) {
-      const vmdMode = !!state.animation;
-      state.avatar = createAvatar(state.mesh, { scene, helper: state.helper, vmdMode });
-    }
-
-    updateInfo();
-    hideLoading();
-    editorStatus.textContent = `✅ 模型「${state.modelName}」加载成功`;
-  } catch (err) {
-    console.error('[MMD] 加载失败:', err);
-    loadingText.textContent = `加载失败: ${err.message || '未知错误'}`;
-    setTimeout(hideLoading, 3000);
-  } finally {
-    if (modelUrl) URL.revokeObjectURL(modelUrl);
-  }
-}
-
-async function applyVMDMotion() {
-  const motionFile = state.fileCache['motion'];
-  if (!motionFile || !state.mesh) return;
-
-  try {
-    showLoading('加载 VMD 动作...');
-
-    if (state.avatar) {
-      state.avatar.stopAllAnimations();
-    }
-    try { state.helper.remove(state.mesh); } catch(e) {}
-
-    const loader = patchMMDLoader(new MMDLoader());
-    const motionBuffer = await motionFile.arrayBuffer();
-    state.vmdArrayBuffer = motionBuffer.slice(0);
-    state.vmdFileName = motionFile.name;
-
-    const motionBlob = new Blob([motionBuffer], { type: 'application/octet-stream' });
-    const motionUrl = URL.createObjectURL(motionBlob);
-
-    const animation = await new Promise((res, rej) => {
-      loader.loadAnimation(motionUrl, state.mesh, res, null, rej);
-    });
-
-    state.animation = animation;
-
-    state.helper.add(state.mesh, {
-      animation: animation,
-      animationRepeat: Infinity,
-      physics: false,
-    });
-
-    if (state.avatar) {
-      state.avatar._vmdMode = true;
-    }
-
-    URL.revokeObjectURL(motionUrl);
-    state.motionName = motionFile.name.replace(/\.vmd$/i, '');
-    updateInfo();
-    editorStatus.textContent = `🎬 正在播放: ${state.motionName}.vmd`;
-    hideLoading();
-  } catch (err) {
-    console.error('[VMD] 加载失败:', err);
-    hideLoading();
-    editorStatus.textContent = `❌ 加载失败: ${err.message}`;
-  }
-}
-
-function updateInfo() {
-  const infoModel = $('#info-model');
-  const infoMotion = $('#info-motion');
-  if (infoModel) infoModel.textContent = state.modelName || '未加载';
-  if (infoMotion) infoMotion.textContent = state.motionName || '无';
-}
-
-function handleFolderUpload(files) {
-  for (const key in state.textureUrlMap) URL.revokeObjectURL(state.textureUrlMap[key]);
-  state.fileCache = {};
-  state.textureUrlMap = {};
-  state.modelName = state.motionName = '';
-  state.folderName = '';
-
-  if (files.length > 0 && files[0].webkitRelativePath) {
-    state.folderName = files[0].webkitRelativePath.replace(/\\/g, '/').split('/')[0];
-  }
-
-  let foundModel = false;
-  for (const file of files) {
-    const n = file.name.toLowerCase();
-    if (n.endsWith('.pmx') || n.endsWith('.pmd')) {
-      state.fileCache['model'] = file;
-      state.modelName = file.name.replace(/\.(pmx|pmd)$/i, '');
-      foundModel = true;
-    } else if (n.endsWith('.vmd')) {
-      if (!state.fileCache['motion']) {
-        state.fileCache['motion'] = file;
-        state.motionName = file.name.replace(/\.vmd$/i, '');
-      } else {
-        state.fileCache['camera'] = file;
-      }
-    } else {
-      state.fileCache['tex_' + file.name] = file;
-    }
-  }
-
-  if (!foundModel) { alert('未找到 PMX/PMD 文件！'); return; }
-
-  $('#file-folder-name').textContent = `✓ ${state.folderName} (${files.length} 文件)`;
-  $('#file-motion-name').textContent = state.motionName ? `✓ ${state.motionName}.vmd` : '未选择';
-
-  loadMMD();
-}
-
-function applyPoseToMesh(landmarks) {
-  if (!state.mesh || !state.mesh.skeleton) return;
-
-  // 使用模糊匹配构建骨骼映射
-  const boneMap = buildPoseBoneMap(state.mesh.skeleton.bones);
-  const poseData = solvePoseToBones(landmarks, boneMap, state.poseRestWorldQuats);
-
-  const bones = state.mesh.skeleton.bones;
-  for (const boneName in poseData) {
-    const data = poseData[boneName];
-    const bone = bones[data.idx];
-    if (!bone) continue;
-    bone.quaternion.copy(data.quat);
-    bone.matrixWorldNeedsUpdate = true;
-  }
-
-  for (const bone of bones) {
-    if (!bone.parent || !bone.parent.isBone) {
-      bone.updateMatrixWorld(true);
-    }
-  }
-  state.mesh.skeleton.update();
-  if (state.mesh.skeleton.boneTexture) {
-    state.mesh.skeleton.computeBoneTexture();
-  }
-}
-
-/**
- * 预计算每个骨骼的 rest 世界四元数
- * 关键：用 bone.getWorldQuaternion() 获取真实的世界旋转
- */
-function computeRestWorldQuats(mesh) {
-  mesh.updateMatrixWorld(true);
-  const bones = mesh.skeleton.bones;
-  const result = {};
-  for (let i = 0; i < bones.length; i++) {
-    const q = new THREE.Quaternion();
-    bones[i].getWorldQuaternion(q);
-    result[bones[i].name] = q;
-  }
-  return result;
-}
-
-function animate() {
-  requestAnimationFrame(animate);
-  const delta = state.clock.getDelta();
-
-  if (state.isPlaying) {
-    controls.update();
-
-    // 摄像头动作捕捉优先
-    if (state.poseActive && state.poseLandmarks && state.mesh) {
-      applyPoseToMesh(state.poseLandmarks);
-    } else if (state.helper) {
-      state.helper.update(delta);
-    }
-
-    // 持续绘制摄像头预览（使用归一化坐标）
-    if (state.poseActive && state.poseCapture) {
-      const canvasEl = $('#pose-canvas');
-      const videoEl = $('#pose-video');
-      if (canvasEl && videoEl && videoEl.readyState >= 2) {
-        const ctx = canvasEl.getContext('2d');
-        drawPoseCanvas(ctx, state.poseLandmarks, canvasEl.width, canvasEl.height, videoEl);
-      }
-    }
-
-    if (state.avatar && !state.avatar._vmdMode && !state.poseActive) {
-      state.avatar.userWorldPos.set(
-        camera.position.x * 0.3,
-        camera.position.y * 0.3,
-        camera.position.z * 0.3,
-      );
-      state.avatar.update(delta);
-    }
-
-    // 录制中
-    if (state.isRecording && state.recorder) {
-      state.recorder.captureFrame();
-      const dur = state.recorder.getDuration();
-      const frames = state.recorder.getFrameCount();
-      $('#record-status').textContent = `🔴 录制中: ${frames}帧 / ${dur.toFixed(1)}秒`;
-    }
-  }
-
-  renderer.render(scene, camera);
-}
-
-document.querySelectorAll('.file-input-folder').forEach((input) => {
-  input.addEventListener('change', (e) => {
-    if (e.target.files.length > 0) handleFolderUpload(e.target.files);
-  });
-});
-
-dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-dropZone.addEventListener('dragleave', () => { dropZone.classList.remove('drag-over'); });
-dropZone.addEventListener('drop', (e) => {
-  e.preventDefault();
-  dropZone.classList.remove('drag-over');
-  const files = Array.from(e.dataTransfer.files);
-  if (files.length > 1 && files.some((f) => f.name.toLowerCase().endsWith('.pmx') || f.name.toLowerCase().endsWith('.pmd'))) {
-    handleFolderUpload(files);
-  }
-});
-
-document.querySelectorAll('.file-input').forEach((input) => {
-  input.addEventListener('change', (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const type = input.dataset.type;
-    const name = file.name.toLowerCase();
-
-    if (type === 'motion') {
-      state.fileCache['motion'] = file;
-      state.motionName = file.name.replace(/\.vmd$/i, '');
-      $('#file-motion-name').textContent = `✓ ${state.motionName}.vmd`;
-      if (state.mesh) {
-        applyVMDMotion();
-      }
+      updateModelListUI();
+      updateInfoChips();
+    } else if (viewerState.type === 'vmd-playing') {
+      setStatus(`正在播放: ${viewerState.name}`);
+      if (_lastAIMsgEl) setAIMotion(_lastAIMsgEl, '▶ 动作已播放');
+    } else if (viewerState.type === 'play-state') {
+      state.isPlaying = viewerState.isPlaying;
+      updatePlayButton();
+    } else if (viewerState.type === 'snapshot') {
+      // 下载快照
+      const a = document.createElement('a');
+      a.href = viewerState.dataUrl;
+      a.download = viewerState.name;
+      a.click();
+      setStatus(`已保存快照: ${viewerState.name}`);
+    } else if (viewerState.type === 'model-error') {
+      setStatus(`模型加载失败: ${viewerState.error}`);
+      hideLoading();
+    } else if (viewerState.type === 'compile-error') {
+      setStatus(`编译失败: ${viewerState.error}`);
+      if (_lastAIMsgEl) setAIMotion(_lastAIMsgEl, '✗ 动作编译失败: ' + viewerState.error, true);
     }
   });
-});
-
-$('#btn-play').addEventListener('click', () => {
-  state.isPlaying = !state.isPlaying;
-  $('#btn-play').textContent = state.isPlaying ? '⏯️' : '▶';
-});
-
-$('#btn-reset-camera').addEventListener('click', () => {
-  camera.position.set(0, 8, 45);
-  controls.target.set(0, 10, 0);
-  controls.update();
-});
-
-$('#speed-slider').addEventListener('input', () => {
-  const val = parseFloat($('#speed-slider').value);
-  $('#speed-label').textContent = val.toFixed(1) + 'x';
-  state.helper.setAnimationSpeed(val);
-});
-
-// 摄像头、录制、快照
-$('#btn-camera').addEventListener('click', () => {
-  if (state.poseActive) stopCamera();
-  else startCamera();
-});
-
-$('#btn-record').addEventListener('click', () => {
-  if (state.isRecording) stopRecording();
-  else startRecording();
-});
-
-$('#btn-snapshot').addEventListener('click', takeSnapshot);
-
-$('#btn-calibrate').addEventListener('click', () => {
-  if (!state.poseActive) {
-    editorStatus.textContent = '⚠️ 请先启动摄像头';
-    return;
-  }
-  resetCalibration();
-  // 重新记录 rest pose
-  state.poseRestQuats = {};
-  const bones = state.mesh.skeleton.bones;
-  for (let i = 0; i < bones.length; i++) {
-    state.poseRestQuats[bones[i].name] = bones[i].quaternion.clone();
-  }
-  state.poseRestWorldQuats = computeRestWorldQuats(state.mesh);
-  editorStatus.textContent = '🎯 校准完成，开始动作捕捉';
-});
-
-$('#btn-mirror').addEventListener('click', () => {
-  const newMode = !getMirrorMode();
-  setMirrorMode(newMode);
-  $('#btn-mirror').textContent = newMode ? '🪞 镜像' : '🎭 木偶';
-  editorStatus.textContent = newMode ? '🪞 镜像模式：抬右手→模型左手' : '🎭 木偶模式：抬右手→模型右手';
-});
-
-$('#pose-close').addEventListener('click', () => {
-  if (state.poseActive) stopCamera();
-});
-
-$('#btn-decompile').addEventListener('click', async () => {
-  const buffer = state.vmdArrayBuffer;
-  if (!buffer) {
-    editorStatus.textContent = '⚠️ 请先上传 VMD 文件';
-    return;
-  }
-  try {
-    startProgress();
-    editorStatus.textContent = '反编译中...';
-    const text = await vmdToText(buffer, showProgress);
-    endProgress();
-
-    // 下载为文本文件
-    const baseName = state.vmdFileName.replace(/\.vmd$/i, '');
-    const fileName = baseName + '_decompiled.txt';
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    a.click();
-    URL.revokeObjectURL(url);
-
-    const boneCount = text.split('\n').filter(l => l.startsWith('b ')).length;
-    const morphCount = text.split('\n').filter(l => l.startsWith('m ')).length;
-    editorStatus.textContent = `✅ 已下载 ${fileName}: ${boneCount.toLocaleString()}骨骼帧, ${morphCount.toLocaleString()}形变帧`;
-  } catch (err) {
-    endProgress();
-    editorStatus.textContent = `❌ 反编译失败: ${err.message}`;
-  }
-});
-
-// 上传文本文件
-$('#mpl-file-input').addEventListener('change', async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-  try {
-    state.mplFileText = await file.text();
-    state.mplFileName = file.name;
-    $('#mpl-file-name').textContent = `✓ ${file.name}`;
-    const boneCount = state.mplFileText.split('\n').filter(l => l.startsWith('b ')).length;
-    const morphCount = state.mplFileText.split('\n').filter(l => l.startsWith('m ')).length;
-    editorStatus.textContent = `📄 已加载: ${boneCount.toLocaleString()}骨骼帧, ${morphCount.toLocaleString()}形变帧`;
-  } catch (err) {
-    editorStatus.textContent = `❌ 读取文件失败: ${err.message}`;
-  }
-});
-
-$('#btn-compile').addEventListener('click', async () => {
-  if (!state.mplFileText) {
-    editorStatus.textContent = '⚠️ 请先上传文本文件';
-    return;
-  }
-  if (!state.mesh) {
-    editorStatus.textContent = '⚠️ 请先加载模型';
-    return;
-  }
-
-  const text = state.mplFileText;
-
-  // 1. 文本 → VMD 二进制（异步）
-  let vmdData;
-  try {
-    startProgress();
-    editorStatus.textContent = '编译中...';
-    vmdData = await textToVMD(text, showProgress);
-  } catch (err) {
-    endProgress();
-    editorStatus.textContent = `❌ 编译失败: ${err.message}`;
-    return;
-  }
-
-  // 2. 用 MMDLoader 加载编译出的 VMD 并播放
-  if (state.avatar) {
-    state.avatar.stopAllAnimations();
-    state.avatar._vmdMode = true;
-    state.avatar._vmdModePureJS = false;
-  }
-  try { state.helper.remove(state.mesh); } catch(e) {}
-
-  editorStatus.textContent = '加载动画...';
-  state.isPlaying = true;
-  $('#btn-play').textContent = '⏯️';
-  const loader = new MMDLoader();
-  const blob = new Blob([vmdData], { type: 'application/octet-stream' });
-  const url = URL.createObjectURL(blob);
-
-  loader.loadAnimation(url, state.mesh, (animation) => {
-    URL.revokeObjectURL(url);
-    state.animation = animation;
-    state.helper.add(state.mesh, {
-      animation: animation,
-      animationRepeat: Infinity,
-      physics: false,
-    });
-    endProgress();
-    editorStatus.textContent = `▶ 播放中: ${animation.tracks.length}轨道, ${animation.duration.toFixed(1)}秒`;
-    state.motionName = '编译 VMD';
-    updateInfo();
-  }, null, (err) => {
-    URL.revokeObjectURL(url);
-    endProgress();
-    // MMDLoader 失败，回退到 Pure-JS 直接播放
-    console.warn('[Compile] MMDLoader 播放失败，回退到 Pure-JS:', err);
-    try {
-      const clip = createDirectAnimationClip(text, state.mesh.skeleton, state.mesh.morphTargetDictionary);
-      state.avatar.stopAllAnimations();
-      state.avatar._vmdMode = false;
-      state.avatar._vmdModePureJS = true;
-
-      // 手动驱动 clip
-      state.avatar._animClip = clip;
-      state.avatar._animTime = 0;
-
-      editorStatus.textContent = `▶ Pure-JS 播放: ${clip.tracks.length}轨道, ${clip.duration.toFixed(1)}秒`;
-      state.motionName = '编译 VMD (Pure-JS)';
-      updateInfo();
-    } catch (fallbackErr) {
-      editorStatus.textContent = `❌ 播放失败: ${fallbackErr.message}`;
-    }
-  });
-});
+}
 
 // ═══════════════════════════════════════════════════════════
-//  摄像头动作捕捉
+//  文件夹扫描（Electron dialog）
+// ═══════════════════════════════════════════════════════════
+
+async function pickModelsFolder() {
+  if (!api || !api.pickModelsFolder) {
+    setStatus('需要 Electron 环境才能选择文件夹');
+    return;
+  }
+  const result = await api.pickModelsFolder();
+  if (!result) return;
+
+  const { folderPath, files } = result;
+  const folderName = folderPath.split(/[\\/]/).pop();
+
+  // 收集 PMX/PMD
+  const modelFiles = files.filter(f => {
+    const n = f.name.toLowerCase();
+    return n.endsWith('.pmx') || n.endsWith('.pmd');
+  });
+
+  if (modelFiles.length === 0) {
+    setStatus('文件夹中未找到 PMX/PMD 文件');
+    return;
+  }
+
+  // 清除同文件夹旧条目
+  state.modelLibrary = state.modelLibrary.filter(m => m.folderName !== folderName);
+
+  for (const mf of modelFiles) {
+    const name = mf.name.replace(/\.(pmx|pmd)$/i, '');
+    // 收集贴图文件（同目录下）
+    const textureFiles = files.filter(f => {
+      const n = f.name.toLowerCase();
+      return /\.(png|jpg|jpeg|bmp|tga|dds|tiff?|spa|sph)$/i.test(n);
+    }).map(f => ({ name: f.name, relativePath: f.relativePath, fullPath: f.fullPath }));
+
+    state.modelLibrary.push({
+      id: nextModelId(),
+      name,
+      pmxPath: mf.fullPath,
+      textureFiles,
+      folderName,
+      size: mf.size,
+    });
+  }
+
+  $('#models-folder-hint').textContent = `${folderName} · ${modelFiles.length} 个模型`;
+  updateModelListUI();
+  updateInfoChips();
+  setStatus(`扫描到 ${modelFiles.length} 个模型`);
+}
+
+async function pickMotionsFolder() {
+  if (!api || !api.pickMotionsFolder) {
+    setStatus('需要 Electron 环境才能选择文件夹');
+    return;
+  }
+  const result = await api.pickMotionsFolder();
+  if (!result) return;
+
+  const { folderPath, files } = result;
+  const folderName = folderPath.split(/[\\/]/).pop();
+
+  const motionFiles = files.filter(f => {
+    const n = f.name.toLowerCase();
+    return n.endsWith('.vmd') || n.endsWith('.txt') || n.endsWith('.mpl');
+  });
+
+  if (motionFiles.length === 0) {
+    setStatus('文件夹中未找到 VMD/TXT 文件');
+    return;
+  }
+
+  state.motionLibrary = state.motionLibrary.filter(m => m.folderName !== folderName);
+
+  for (const f of motionFiles) {
+    const n = f.name.toLowerCase();
+    const type = n.endsWith('.vmd') ? 'vmd' : 'txt';
+    const name = f.name.replace(/\.(vmd|txt|mpl)$/i, '');
+    state.motionLibrary.push({
+      id: nextMotionId(),
+      name,
+      type,
+      path: f.fullPath,
+      folderName,
+      size: f.size,
+      text: null,  // txt 文件内容按需读取
+    });
+  }
+
+  $('#motions-folder-hint').textContent = `${folderName} · ${motionFiles.length} 个动作`;
+  updateMotionListUI();
+  updateInfoChips();
+  setStatus(`扫描到 ${motionFiles.length} 个动作`);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  模型/动作操作
+// ═══════════════════════════════════════════════════════════
+
+async function loadModel(modelEntry) {
+  await ensureViewerOpen();
+  showLoading(`加载模型: ${modelEntry.name}...`);
+  sendToViewer('viewer:load-model', {
+    id: modelEntry.id,
+    name: modelEntry.name,
+    pmxPath: modelEntry.pmxPath,
+    textureFiles: modelEntry.textureFiles,
+  });
+  // loading 由 viewer 回传的 model-loaded/model-error 关闭
+}
+
+async function applyMotion(motionEntry) {
+  if (state.poseActive) stopCamera();
+
+  state.activeMotionId = motionEntry.id;
+
+  try {
+    if (motionEntry.type === 'vmd') {
+      showLoading(`加载 VMD: ${motionEntry.name}...`);
+      // 读取 VMD 文件内容（用于反编译），同时传路径给 viewer
+      if (api && api.readFileArrayBuffer) {
+        state.vmdArrayBuffer = await api.readFileArrayBuffer(motionEntry.path);
+        state.vmdFileName = motionEntry.name + '.vmd';
+      }
+      sendToViewer('viewer:play-vmd', {
+        vmdPath: motionEntry.path,
+        name: motionEntry.name,
+      });
+      hideLoading();
+    } else if (motionEntry.type === 'txt') {
+      showLoading(`编译文本: ${motionEntry.name}...`);
+      // 读取文本内容
+      let text = motionEntry.text;
+      if (!text && api && api.readFileArrayBuffer) {
+        // 读取文本文件
+        const buffer = await api.readFileArrayBuffer(motionEntry.path);
+        text = new TextDecoder('utf-8').decode(buffer);
+        motionEntry.text = text;
+      }
+      state.mplFileText = text;
+      state.mplFileName = motionEntry.name;
+      $('#mpl-file-name').textContent = `✓ ${motionEntry.name}`;
+      sendToViewer('viewer:compile-mpl', {
+        text,
+        name: motionEntry.name,
+      });
+      hideLoading();
+    }
+    updateMotionListUI();
+  } catch (err) {
+    console.error('[Motion] 加载失败:', err);
+    hideLoading();
+    setStatus(`动作加载失败: ${err.message}`);
+  }
+}
+
+function clearScene() {
+  sendToViewer('viewer:clear-scene', {});
+  setStatus('场景已清空');
+}
+
+// ═══════════════════════════════════════════════════════════
+//  动捕（在控制面板运行，landmarks 传给 viewer）
 // ═══════════════════════════════════════════════════════════
 
 async function startCamera() {
-  if (!state.mesh) {
-    editorStatus.textContent = '⚠️ 请先加载模型';
+  if (!state.activeModelId) {
+    setStatus('请先加载模型');
     return;
   }
 
   const videoEl = $('#pose-video');
-  const canvasEl = $('#pose-canvas');
-  const ctx = canvasEl.getContext('2d');
-
-  // ★ 关键：先停止所有动画，重置骨骼到 rest pose，再计算 restWorldQuats
-  if (state.avatar) {
-    state.avatar.stopAllAnimations();
-    state.avatar._vmdMode = false;
-    state.avatar._vmdModePureJS = false;
-  }
-  try { state.helper.remove(state.mesh); } catch(e) {}
-
-  // 手动重置所有骨骼到 rest pose
-  const bones = state.mesh.skeleton.bones;
-  if (state.avatar && state.avatar._boneRest) {
-    for (let i = 0; i < bones.length; i++) {
-      if (state.avatar._boneRest[i]) {
-        bones[i].quaternion.copy(state.avatar._boneRest[i]);
-      }
-      if (state.avatar._boneRestPos[i]) {
-        bones[i].position.copy(state.avatar._boneRestPos[i]);
-      }
-    }
-  }
-  state.mesh.updateMatrixWorld(true);
-
-  // 现在骨骼在真正的 rest pose，计算 rest 数据
-  state.poseRestQuats = {};
-  for (let i = 0; i < bones.length; i++) {
-    state.poseRestQuats[bones[i].name] = bones[i].quaternion.clone();
-  }
-  state.poseRestWorldQuats = computeRestWorldQuats(state.mesh);
-  console.log('[Pose] restWorldQuats 已计算, 骨骼数:', Object.keys(state.poseRestWorldQuats).length);
 
   try {
-    editorStatus.textContent = '正在加载姿态检测模型（首次需下载，约10秒）...';
-
-    state.poseCapture = await initPoseCapture(videoEl, (results) => {
+    setStatus('正在加载 Holistic 检测模型（首次需下载，约10秒）...');
+    state.poseCapture = new PoseCaptureSystem();
+    await state.poseCapture.init((msg) => setStatus('📷 ' + msg));
+    await state.poseCapture.startCamera(videoEl, (results) => {
       state.poseLandmarks = results;
-    }, (msg) => {
-      editorStatus.textContent = '📷 ' + msg;
-    });
+      // 实时传 landmarks 给 viewer
+      sendToViewer('viewer:landmarks', results);
+    }, (msg) => setStatus('📷 ' + msg));
     state.poseActive = true;
+
+    // 通知 viewer 进入动捕模式（准备 solver）
+    sendToViewer('viewer:start-camera', {});
 
     $('#pose-panel').classList.add('active');
     $('#btn-camera').textContent = '⏹ 停止';
-    editorStatus.textContent = '📷 摄像头已启动，站直后点击「🎯 校准」';
+    setStatus('📷 摄像头已启动');
   } catch (err) {
-    editorStatus.textContent = `❌ 摄像头启动失败: ${err.message}`;
+    setStatus(`摄像头启动失败: ${err.message}`);
     console.error('[Pose] 启动失败:', err);
   }
 }
@@ -702,97 +346,515 @@ function stopCamera() {
   }
   state.poseActive = false;
   state.poseLandmarks = null;
-  $('#pose-panel').classList.remove('active');
-  $('#btn-camera').textContent = '📷 摄像头';
 
-  // 恢复骨骼到 rest
-  if (state.avatar) {
-    state.avatar.stopAllAnimations();
+  if (state.isRecording) {
+    stopRecording();
   }
-  editorStatus.textContent = '摄像头已停止';
+
+  sendToViewer('viewer:stop-camera', {});
+
+  $('#pose-panel').classList.remove('active');
+  $('#btn-camera').textContent = '📷 启动捕捉';
+  setStatus('摄像头已停止');
 }
 
 // ═══════════════════════════════════════════════════════════
-//  录制
+//  录制（TODO：recorder 需要 mesh，目前先在控制面板留 UI，实际录制逻辑后续移到 viewer）
 // ═══════════════════════════════════════════════════════════
 
 function startRecording() {
-  if (!state.mesh) {
-    editorStatus.textContent = '⚠️ 请先加载模型';
-    return;
-  }
-
-  state.recorder = new VMDRecorder(state.mesh);
-  state.recorder.start();
-  state.isRecording = true;
-  $('#btn-record').textContent = '⏹ 停止';
-  $('#btn-record').classList.add('recording');
-  $('#record-status').textContent = '🔴 录制中...';
-  editorStatus.textContent = '🔴 开始录制';
+  if (!state.activeModelId) { setStatus('请先加载模型'); return; }
+  // TODO: 录制需要访问 viewer 的 mesh，后续通过 IPC 实现
+  setStatus('录制功能需要 viewer 端配合（开发中）');
 }
 
 async function stopRecording() {
-  if (!state.isRecording || !state.recorder) return;
-
+  if (!state.recorder) return;
+  const data = state.recorder.stop();
   state.isRecording = false;
-  const vmdData = state.recorder.stop();
-  const frameCount = state.recorder.getFrameCount();
-
-  const fileName = prompt('请输入录制文件名:', 'recording_' + Date.now());
-  if (!fileName) {
-    $('#btn-record').textContent = '🔴 录制';
-    $('#btn-record').classList.remove('recording');
-    $('#record-status').textContent = '';
-    state.recorder = null;
-    editorStatus.textContent = '已取消保存';
-    return;
-  }
-
-  try {
-    const path = await saveRecording(fileName, vmdData);
-    editorStatus.textContent = `✅ 已保存: ${path} (${frameCount}帧)`;
-    $('#record-status').textContent = `已保存: ${fileName}.vmd`;
-  } catch (err) {
-    editorStatus.textContent = `❌ 保存失败: ${err.message}`;
-    $('#record-status').textContent = '';
-  }
-
-  $('#btn-record').textContent = '🔴 录制';
-  $('#btn-record').classList.remove('recording');
-  state.recorder = null;
+  $('#btn-record').textContent = '🔴 开始录制';
+  const name = `capture_${Date.now()}.vmd`;
+  await saveRecording(name, data);
+  $('#record-status').textContent = `已保存: ${name}`;
+  setStatus(`已保存录制: ${name}`);
 }
 
 // ═══════════════════════════════════════════════════════════
-//  快照
+//  反编译
 // ═══════════════════════════════════════════════════════════
 
-async function takeSnapshot() {
-  if (!state.mesh) {
-    editorStatus.textContent = '⚠️ 请先加载模型';
-    return;
-  }
-
-  const recorder = new VMDRecorder(state.mesh);
-  const vmdData = recorder.snapshot();
-
-  const fileName = prompt('请输入快照文件名:', 'snapshot_' + Date.now());
-  if (!fileName) {
-    editorStatus.textContent = '已取消保存';
-    return;
-  }
-
+async function decompileVMD() {
+  if (!state.vmdArrayBuffer) { setStatus('请先加载 VMD 动作'); return; }
   try {
-    const path = await saveSnapshot(fileName, vmdData);
-    editorStatus.textContent = `✅ 快照已保存: ${path}`;
+    startProgress();
+    setStatus('反编译中...');
+    const text = await vmdToText(state.vmdArrayBuffer, showProgress);
+    endProgress();
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = state.vmdFileName.replace(/\.vmd$/i, '.txt');
+    a.click();
+    URL.revokeObjectURL(url);
+    setStatus(`已下载: ${state.vmdFileName.replace(/\.vmd$/i, '.txt')}`);
   } catch (err) {
-    editorStatus.textContent = `❌ 保存失败: ${err.message}`;
+    endProgress();
+    setStatus(`反编译失败: ${err.message}`);
   }
 }
 
-async function init() {
-  await initAmmo();
-  animate();
-  hideLoading();
+// ═══════════════════════════════════════════════════════════
+//  UI 更新
+// ═══════════════════════════════════════════════════════════
+
+function updateInfoChips() {
+  $('#chip-models .chip-value').textContent = state.modelLibrary.length;
+  $('#chip-motions .chip-value').textContent = state.motionLibrary.length;
+}
+
+function updateModelListUI() {
+  const list = $('#models-list');
+  if (state.modelLibrary.length === 0) {
+    list.innerHTML = `
+      <div class="empty-state">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.3"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+        <p>选择文件夹后<br/>模型将显示在此处</p>
+      </div>`;
+    return;
+  }
+  list.innerHTML = state.modelLibrary.map(m => {
+    const isActive = state.activeModelId === m.id;
+    const sizeStr = m.size > 1024 * 1024 ? (m.size / 1024 / 1024).toFixed(1) + ' MB' : (m.size / 1024).toFixed(0) + ' KB';
+    return `
+      <div class="resource-item ${isActive ? 'active' : ''}" data-id="${m.id}" data-kind="model">
+        <div class="resource-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+        </div>
+        <div class="resource-info">
+          <div class="resource-name">${escapeHtml(m.name)}</div>
+          <div class="resource-meta">
+            <span>${sizeStr}</span>
+            ${isActive ? '<span class="resource-tag">已加载</span>' : ''}
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function updateMotionListUI() {
+  const list = $('#motions-list');
+  if (state.motionLibrary.length === 0) {
+    list.innerHTML = `
+      <div class="empty-state">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.3"><path d="M5 4l14 8-14 8V4z"/></svg>
+        <p>选择文件夹后<br/>动作将显示在此处</p>
+      </div>`;
+    return;
+  }
+  const filtered = state.motionFilter === 'all'
+    ? state.motionLibrary
+    : state.motionLibrary.filter(m => m.type === state.motionFilter);
+
+  list.innerHTML = filtered.map(m => {
+    const isActive = state.activeMotionId === m.id;
+    const sizeStr = m.size > 1024 * 1024 ? (m.size / 1024 / 1024).toFixed(1) + ' MB' : (m.size / 1024).toFixed(0) + ' KB';
+    return `
+      <div class="resource-item ${isActive ? 'active' : ''}" data-id="${m.id}" data-kind="motion">
+        <div class="resource-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4l14 8-14 8V4z"/></svg>
+        </div>
+        <div class="resource-info">
+          <div class="resource-name">${escapeHtml(m.name)}</div>
+          <div class="resource-meta">
+            <span>${m.type.toUpperCase()}</span>
+            <span>${sizeStr}</span>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+function updatePlayButton() {
+  const icon = $('#play-icon');
+  if (state.isPlaying) {
+    icon.innerHTML = '<rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/>';
+  } else {
+    icon.innerHTML = '<polygon points="6 4 20 12 6 20 6 4"/>';
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  事件绑定
+// ═══════════════════════════════════════════════════════════
+
+function bindEvents() {
+  // Tab 切换
+  $$('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      $$('.tab-btn').forEach(b => b.classList.remove('active'));
+      $$('.tab-panel').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      const tab = btn.dataset.tab;
+      $(`#panel-${tab}`).classList.add('active');
+    });
+  });
+
+  // 文件夹选择（改用 Electron dialog）
+  $('#pick-models-folder').addEventListener('click', pickModelsFolder);
+  $('#pick-motions-folder').addEventListener('click', pickMotionsFolder);
+
+  // 资源列表点击
+  document.addEventListener('click', (e) => {
+    const item = e.target.closest('.resource-item');
+    if (!item) return;
+    const id = item.dataset.id;
+    const kind = item.dataset.kind;
+    if (kind === 'model') {
+      const entry = state.modelLibrary.find(m => m.id === id);
+      if (entry) loadModel(entry);
+    } else if (kind === 'motion') {
+      const entry = state.motionLibrary.find(m => m.id === id);
+      if (entry) applyMotion(entry);
+    }
+  });
+
+  // 动作筛选
+  $$('.filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      $$('.filter-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.motionFilter = btn.dataset.filter;
+      updateMotionListUI();
+    });
+  });
+
+  // 播放控制
+  $('#btn-play').addEventListener('click', () => {
+    state.isPlaying = !state.isPlaying;
+    updatePlayButton();
+    sendToViewer('viewer:toggle-play', {});
+  });
+
+  $('#btn-reset-camera').addEventListener('click', () => {
+    sendToViewer('viewer:reset-camera', {});
+  });
+
+  $('#speed-slider').addEventListener('input', (e) => {
+    const val = parseFloat(e.target.value);
+    $('#speed-label').textContent = val.toFixed(1) + 'x';
+    sendToViewer('viewer:set-speed', { speed: val });
+  });
+
+  $('#btn-clear-scene').addEventListener('click', clearScene);
+
+  // 动捕
+  $('#btn-camera').addEventListener('click', () => {
+    if (state.poseActive) stopCamera();
+    else startCamera();
+  });
+  $('#pose-close').addEventListener('click', stopCamera);
+  $('#btn-calibrate').addEventListener('click', () => {
+    resetCalibration();
+    setStatus('校准已重置');
+  });
+  $('#btn-mirror').addEventListener('click', () => {
+    const newMode = !getMirrorMode();
+    setMirrorMode(newMode);
+    $('#btn-mirror').textContent = newMode ? '🪞 镜像' : '🎭 木偶';
+    sendToViewer('viewer:set-mirror', { mirror: newMode });
+  });
+
+  // 图片/视频提取（TODO：需要传给 viewer 或在控制面板处理后传 landmarks）
+  $('#btn-pose-image').addEventListener('click', async () => {
+    if (!api || !api.pickMediaFile) return;
+    const result = await api.pickMediaFile([
+      { name: '图片', extensions: ['png', 'jpg', 'jpeg'] },
+    ]);
+    if (!result) return;
+    setStatus(`已选择图片: ${result.name}`);
+    // TODO: 在控制面板处理图片提取姿势，然后传 landmarks 给 viewer
+  });
+
+  $('#btn-pose-video').addEventListener('click', async () => {
+    if (!api || !api.pickMediaFile) return;
+    const result = await api.pickMediaFile([
+      { name: '视频', extensions: ['mp4', 'webm', 'avi'] },
+    ]);
+    if (!result) return;
+    setStatus(`已选择视频: ${result.name}`);
+    // TODO: 在控制面板处理视频提取动作
+  });
+
+  // 反编译/编译
+  $('#btn-decompile').addEventListener('click', decompileVMD);
+
+  $('#mpl-file-input').addEventListener('change', async (e) => {
+    // Electron 模式下改用 dialog，这个 input 可能不会触发
+    const file = e.target.files[0];
+    if (!file) return;
+    state.mplFileText = await file.text();
+    state.mplFileName = file.name.replace(/\.(txt|mpl)$/i, '');
+    $('#mpl-file-name').textContent = `✓ ${file.name}`;
+    setStatus(`已加载文本: ${file.name}`);
+  });
+
+  $('#btn-compile').addEventListener('click', async () => {
+    if (!state.mplFileText) { setStatus('请先选择文本文件'); return; }
+    sendToViewer('viewer:compile-mpl', {
+      text: state.mplFileText,
+      name: state.mplFileName,
+    });
+  });
+
+  // 录制
+  $('#btn-record').addEventListener('click', () => {
+    if (state.isRecording) stopRecording();
+    else startRecording();
+  });
+  $('#btn-snapshot').addEventListener('click', () => {
+    sendToViewer('viewer:snapshot', {});
+  });
+
+  bindAIChat();
+}
+
+// ═══════════════════════════════════════════════════════════
+//  AI 对话（DeepSeek + MPL 动作生成）
+// ═══════════════════════════════════════════════════════════
+
+const AI_KEY_STORAGE = 'mmd_deepseek_api_key';
+const aiMessagesEl = () => $('#ai-messages');
+const aiInputEl = () => $('#ai-input');
+const aiStatusEl = () => $('#ai-status');
+let _lastAIMsgEl = null;  // 最近一条 AI 消息元素，用于回写动作状态
+
+function setAIStatus(msg, kind) {
+  const el = aiStatusEl();
+  if (!el) return;
+  el.textContent = msg || '';
+  el.className = 'ai-status' + (kind ? ' ' + kind : '');
+}
+
+// 追加一条消息到聊天区，返回该消息元素
+function appendAIMsg(role, text) {
+  const el = aiMessagesEl();
+  if (!el) return null;
+  // 首次发送时清空空状态提示
+  const empty = el.querySelector('.ai-empty');
+  if (empty) empty.remove();
+
+  const msg = document.createElement('div');
+  msg.className = 'ai-msg ' + (role === 'user' ? 'user' : 'ai');
+  const roleEl = document.createElement('div');
+  roleEl.className = 'ai-msg-role';
+  roleEl.textContent = role === 'user' ? '我' : '角色';
+  const bubble = document.createElement('div');
+  bubble.className = 'ai-msg-bubble';
+  bubble.textContent = text;
+  msg.appendChild(roleEl);
+  msg.appendChild(bubble);
+  el.appendChild(msg);
+  el.scrollTop = el.scrollHeight;
+  return msg;
+}
+
+// 在 AI 消息下追加动作状态行
+function setAIMotion(msgEl, text, isErr) {
+  if (!msgEl) return;
+  let motion = msgEl.querySelector('.ai-msg-motion');
+  if (!motion) {
+    motion = document.createElement('div');
+    motion.className = 'ai-msg-motion' + (isErr ? ' err' : '');
+    msgEl.appendChild(motion);
+  }
+  motion.className = 'ai-msg-motion' + (isErr ? ' err' : '');
+  motion.textContent = text;
+}
+
+// 显示"正在思考"动画，返回该消息元素
+function showTyping() {
+  const el = aiMessagesEl();
+  if (!el) return null;
+  const empty = el.querySelector('.ai-empty');
+  if (empty) empty.remove();
+  const msg = document.createElement('div');
+  msg.className = 'ai-msg ai typing';
+  const roleEl = document.createElement('div');
+  roleEl.className = 'ai-msg-role';
+  roleEl.textContent = '角色';
+  const bubble = document.createElement('div');
+  bubble.className = 'ai-msg-bubble';
+  msg.appendChild(roleEl);
+  msg.appendChild(bubble);
+  el.appendChild(msg);
+  el.scrollTop = el.scrollHeight;
+  return msg;
+}
+
+// 从 AI 返回的 content 中解析 {reply, mpl}
+function parseAIResponse(content) {
+  if (!content) return { reply: '', mpl: '' };
+  try {
+    const obj = JSON.parse(content);
+    return {
+      reply: obj.reply || '',
+      mpl: obj.mpl || '',
+    };
+  } catch (e) {
+    // JSON 解析失败：尝试从文本中提取代码块作为兜底
+    const reply = content.replace(/```[\s\S]*?```/g, '').trim();
+    const m = content.match(/```(?:mpl|MPL)?\n?([\s\S]*?)```/);
+    return { reply: reply || content.slice(0, 200), mpl: m ? m[1] : '' };
+  }
+}
+
+async function sendAIMessage() {
+  if (state.aiBusy) return;
+  const input = aiInputEl();
+  const text = (input?.value || '').trim();
+  if (!text) return;
+
+  const apiKey = ($('#ai-api-key').value || '').trim();
+  if (!apiKey) {
+    setAIStatus('请先填写 DeepSeek API Key', 'err');
+    $('#ai-api-key').focus();
+    return;
+  }
+  // 持久化 key
+  localStorage.setItem(AI_KEY_STORAGE, apiKey);
+
+  const model = $('#ai-model').value || 'deepseek-v4-flash';
+
+  // 首次对话注入 system prompt
+  if (state.aiMessages.length === 0) {
+    state.aiMessages.push({ role: 'system', content: AI_SYSTEM_PROMPT });
+  }
+
+  // 显示用户消息
+  appendAIMsg('user', text);
+  state.aiMessages.push({ role: 'user', content: text });
+
+  // 清空输入、禁用、显示思考动画
+  input.value = '';
+  input.style.height = 'auto';
+  $('#ai-send').disabled = true;
+  state.aiBusy = true;
+  setAIStatus('思考中…');
+  const typingEl = showTyping();
+
+  const result = await api.aiChat({ apiKey, model, messages: state.aiMessages });
+
+  state.aiBusy = false;
+  $('#ai-send').disabled = false;
+
+  if (typingEl) typingEl.remove();
+
+  if (!result.ok) {
+    appendAIMsg('ai', '（请求失败：' + result.error + '）');
+    setAIStatus('请求失败: ' + result.error, 'err');
+    // 失败时把刚加入的用户消息从历史移除，避免污染上下文
+    state.aiMessages.pop();
+    return;
+  }
+
+  const { reply, mpl } = parseAIResponse(result.content);
+
+  // 显示角色台词
+  const aiMsgEl = appendAIMsg('ai', reply || '（无回复）');
+  _lastAIMsgEl = aiMsgEl;
+  // 记录 assistant 消息到历史（存原始 content，保持上下文连贯）
+  state.aiMessages.push({ role: 'assistant', content: result.content });
+
+  // 编译并播放 MPL 动作
+  if (mpl && mpl.trim()) {
+    if (!state.viewerOpened) {
+      setAIMotion(aiMsgEl, '⚠ 未打开模型窗口，动作未播放', true);
+      setAIStatus('已回复，但模型窗口未打开', 'err');
+      return;
+    }
+    setAIMotion(aiMsgEl, '正在生成动作…');
+    setAIStatus('已回复，正在播放动作…', 'ok');
+    sendToViewer('viewer:compile-mpl', {
+      text: mpl,
+      name: 'AI生成动作',
+    });
+  } else {
+    setAIStatus('已回复', 'ok');
+  }
+}
+
+function bindAIChat() {
+  // 恢复已保存的 API key
+  const savedKey = localStorage.getItem(AI_KEY_STORAGE);
+  if (savedKey) $('#ai-api-key').value = savedKey;
+
+  // 显示/隐藏 key
+  $('#ai-key-toggle').addEventListener('click', () => {
+    const inp = $('#ai-api-key');
+    inp.type = inp.type === 'password' ? 'text' : 'password';
+  });
+
+  // 清空对话
+  $('#ai-clear').addEventListener('click', () => {
+    state.aiMessages = [];
+    const el = aiMessagesEl();
+    if (el) {
+      el.innerHTML = '';
+      const empty = document.createElement('div');
+      empty.className = 'ai-empty';
+      empty.innerHTML = '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.3"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>对话已清空<br/>可重新开始</p>';
+      el.appendChild(empty);
+    }
+    setAIStatus('');
+  });
+
+  // 发送按钮
+  $('#ai-send').addEventListener('click', sendAIMessage);
+
+  // 输入框：Enter 发送，Shift+Enter 换行；自动增高
+  const inp = aiInputEl();
+  inp.addEventListener('input', () => {
+    inp.style.height = 'auto';
+    inp.style.height = Math.min(inp.scrollHeight, 100) + 'px';
+  });
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendAIMessage();
+    }
+  });
+
+  // key 变化时实时持久化
+  $('#ai-api-key').addEventListener('change', () => {
+    localStorage.setItem(AI_KEY_STORAGE, $('#ai-api-key').value.trim());
+  });
+}
+
+// ═══════════════════════════════════════════════════════════
+//  启动
+// ═══════════════════════════════════════════════════════════
+
+function init() {
+  try {
+    console.log('[Control Panel] init() 开始');
+    bindEvents();
+    setMirrorMode(true);
+    console.log('[Control Panel] 初始化完成');
+    document.body.setAttribute('data-init', 'ok');
+  } catch (err) {
+    console.error('[Control Panel] 初始化失败:', err);
+    document.body.setAttribute('data-init', 'error');
+    document.body.setAttribute('data-init-err', err.message);
+    const banner = document.createElement('div');
+    banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#f87171;color:#fff;padding:8px;font-size:12px;z-index:9999;font-family:monospace';
+    banner.textContent = '初始化错误: ' + err.message;
+    document.body.appendChild(banner);
+  }
 }
 
 init();

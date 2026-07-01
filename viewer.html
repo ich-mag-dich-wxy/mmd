@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MMD Viewer</title>
+  <style>
+    /* 透明窗口样式：html/body 完全透明，让 Electron 窗口的透明背景透出桌面 */
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent;  /* 关键：背景透明 */
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    /* 3D 渲染容器：透明 */
+    #scene-container {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    /* 拖动区域：窗口顶部细条，用于拖动整个窗口 */
+    #drag-region {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 24px;
+      -webkit-app-region: drag;  /* Electron 拖动区域 */
+      z-index: 100;
+      /* 拖动区域不可见但可交互 */
+    }
+
+    /* 右上角关闭按钮 */
+    #btn-close {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      border: none;
+      background: rgba(248, 113, 113, 0.7);
+      color: white;
+      cursor: pointer;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      -webkit-app-region: no-drag;  /* 按钮可点击 */
+      z-index: 101;
+      opacity: 0.6;
+      transition: opacity 0.15s;
+    }
+    #btn-close:hover { opacity: 1; }
+
+    /* 加载提示（模型加载时显示） */
+    #loading-overlay {
+      position: absolute;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.3);
+      color: #00e5ff;
+      font-family: system-ui, sans-serif;
+      font-size: 13px;
+      z-index: 50;
+      pointer-events: none;
+    }
+    #loading-overlay.active { display: flex; }
+
+    /* 状态指示器（右下角小字） */
+    #status-text {
+      position: absolute;
+      bottom: 4px;
+      right: 4px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      color: rgba(0, 229, 255, 0.6);
+      z-index: 101;
+      pointer-events: none;
+      -webkit-app-region: no-drag;
+    }
+  </style>
+</head>
+<body>
+  <!-- 3D 场景容器 -->
+  <div id="scene-container"></div>
+
+  <!-- 拖动区域（顶部透明条） -->
+  <div id="drag-region"></div>
+
+  <!-- 关闭按钮 -->
+  <button id="btn-close" title="关闭窗口">×</button>
+
+  <!-- 加载提示 -->
+  <div id="loading-overlay">
+    <div id="loading-text">加载中...</div>
+  </div>
+
+  <!-- 状态文字 -->
+  <div id="status-text"></div>
+
+  <script src="/ammo.wasm.js"></script>
+  <script type="module" src="/viewer.js"></script>
+</body>
+</html>

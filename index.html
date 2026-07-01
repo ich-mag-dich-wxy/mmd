@@ -3,119 +3,344 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MMD Viewer</title>
-  <link rel="stylesheet" href="./style.css" />
+  <title>MMD Studio — 模型 · 动作 · 捕捉</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700;800&family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <!-- style.css 由 main.js 通过 import 引入（vite 标准方式，支持 HMR） -->
+  <script>
+    // 全局错误捕获：如果 main.js 加载/执行失败，在页面顶部显示错误
+    window.addEventListener('error', function(e) {
+      var banner = document.createElement('div');
+      banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#f87171;color:#fff;padding:10px;font-size:12px;z-index:99999;font-family:monospace;white-space:pre-wrap;word-break:break-all';
+      banner.textContent = '[页面错误] ' + (e.message || '未知错误') + (e.filename ? ' @ ' + e.filename.split('/').pop() + ':' + e.lineno : '');
+      document.body.appendChild(banner);
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+      var banner = document.createElement('div');
+      banner.style.cssText = 'position:fixed;top:40px;left:0;right:0;background:#fbbf24;color:#000;padding:10px;font-size:12px;z-index:99999;font-family:monospace;white-space:pre-wrap;word-break:break-all';
+      banner.textContent = '[Promise错误] ' + (e.reason && e.reason.message ? e.reason.message : String(e.reason));
+      document.body.appendChild(banner);
+    });
+    console.log('[index.html] 全局错误捕获已注册');
+  </script>
 </head>
 <body>
-  <div id="scene-container"></div>
-
+  <!-- 加载遮罩 -->
   <div id="loading-overlay">
-    <div class="loading-spinner"></div>
+    <div class="loading-orb">
+      <div class="orb-ring"></div>
+      <div class="orb-ring"></div>
+      <div class="orb-ring"></div>
+      <div class="orb-core"></div>
+    </div>
     <div id="loading-text">初始化中...</div>
   </div>
 
-  <div class="header">
-    <h1>MMD Viewer</h1>
-    <span class="subtitle">加载 MMD 模型 · 播放 VMD · 反编译/编译 · 摄像头动作捕捉</span>
-  </div>
-
-  <div class="info-panel">
-    <div class="info-row">
-      <span class="info-label">模型:</span>
-      <span class="info-value" id="info-model">未加载</span>
-    </div>
-    <div class="info-row">
-      <span class="info-label">动作:</span>
-      <span class="info-value" id="info-motion">无</span>
+  <!-- 中间占位区：模型窗口未打开时显示提示 -->
+  <div class="viewer-placeholder" id="viewer-placeholder">
+    <svg class="placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+      <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+    </svg>
+    <div class="placeholder-text">
+      从左侧选择 <strong>模型文件夹</strong>，点击模型即可打开透明窗口<br/>
+      模型会在独立窗口中显示，背景透明，可拖动/旋转/缩放
     </div>
   </div>
 
-  <div class="upload-panel" id="drop-zone">
-    <h3>加载模型</h3>
-    <p class="hint">拖拽文件夹到此处，或点击下方按钮</p>
-
-    <div class="file-group folder-group">
-      <label class="file-btn folder-btn">
-        📂 选择模型文件夹
-        <input type="file" class="file-input-folder" webkitdirectory multiple hidden />
-      </label>
-      <span class="file-name" id="file-folder-name">包含 PMX/PMD + 贴图</span>
-    </div>
-
-    <div class="divider"><span>VMD 动作文件</span></div>
-
-    <div class="file-group">
-      <label class="file-btn motion-btn">
-        💃 选择 VMD 文件
-        <input type="file" class="file-input" data-type="motion" accept=".vmd" hidden />
-      </label>
-      <span class="file-name" id="file-motion-name">未选择</span>
-    </div>
-  </div>
-
-  <div class="editor-panel">
-    <div class="editor-header">
-      <span>VMD 反编译 / 编译</span>
-    </div>
-    <div class="editor-body">
-      <div class="editor-section">
-        <h4>反编译 (VMD → 文本)</h4>
-        <p class="hint">将已上传的 VMD 反编译为文本文件并下载</p>
-        <button class="editor-btn decompile-btn" id="btn-decompile">🔄 反编译并下载</button>
+  <!-- 顶部标题栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+          <path d="M16 2 L28 9 L28 23 L16 30 L4 23 L4 9 Z" stroke="url(#bg1)" stroke-width="1.5" />
+          <path d="M16 8 L22 12 L22 20 L16 24 L10 20 L10 12 Z" fill="url(#bg2)" opacity="0.6" />
+          <circle cx="16" cy="16" r="2.5" fill="#00e5ff" />
+          <defs>
+            <linearGradient id="bg1" x1="0" y1="0" x2="32" y2="32">
+              <stop offset="0" stop-color="#00e5ff" />
+              <stop offset="1" stop-color="#ffb300" />
+            </linearGradient>
+            <linearGradient id="bg2" x1="0" y1="0" x2="32" y2="32">
+              <stop offset="0" stop-color="#00e5ff" stop-opacity="0.4" />
+              <stop offset="1" stop-color="#ff006e" stop-opacity="0.3" />
+            </linearGradient>
+          </defs>
+        </svg>
       </div>
-      <div class="editor-section">
-        <h4>编译并播放 (文本 → VMD)</h4>
-        <p class="hint">上传反编译的文本文件，编译为 VMD 并播放</p>
+      <div class="brand-text">
+        <h1>MMD Studio</h1>
+        <span>模型 · 动作 · 捕捉</span>
+      </div>
+    </div>
+    <div class="topbar-info" id="topbar-info">
+      <div class="info-chip" id="chip-models">
+        <span class="chip-dot"></span><span class="chip-label">模型</span><span class="chip-value">0</span>
+      </div>
+      <div class="info-chip" id="chip-motions">
+        <span class="chip-dot dot-amber"></span><span class="chip-label">动作</span><span class="chip-value">0</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- 左侧资源面板 -->
+  <aside class="sidebar sidebar-left" id="sidebar-left">
+    <div class="sidebar-header">
+      <div class="sidebar-tabs">
+        <button class="tab-btn active" data-tab="models">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+          模型
+        </button>
+        <button class="tab-btn" data-tab="motions">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4l14 8-14 8V4z"/></svg>
+          动作
+        </button>
+      </div>
+    </div>
+
+    <!-- 模型面板 -->
+    <div class="tab-panel active" id="panel-models">
+      <div class="folder-picker">
+        <button class="folder-btn" id="pick-models-folder">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+          <span>选择模型文件夹</span>
+        </button>
+        <p class="folder-hint" id="models-folder-hint">支持 PMX / PMD，可包含多个模型</p>
+      </div>
+      <div class="resource-list" id="models-list">
+        <div class="empty-state">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.3"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+          <p>选择文件夹后<br/>模型将显示在此处</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 动作面板 -->
+    <div class="tab-panel" id="panel-motions">
+      <div class="folder-picker">
+        <button class="folder-btn folder-btn-amber" id="pick-motions-folder">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+          <span>选择动作文件夹</span>
+        </button>
+        <p class="folder-hint" id="motions-folder-hint">支持 VMD 动作 + 编译 TXT</p>
+      </div>
+      <div class="motion-filter" id="motion-filter">
+        <button class="filter-btn active" data-filter="all">全部</button>
+        <button class="filter-btn" data-filter="vmd">VMD</button>
+        <button class="filter-btn" data-filter="txt">TXT</button>
+      </div>
+      <div class="resource-list" id="motions-list">
+        <div class="empty-state">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.3"><path d="M5 4l14 8-14 8V4z"/></svg>
+          <p>选择文件夹后<br/>动作将显示在此处</p>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 右侧工具面板 -->
+  <aside class="sidebar sidebar-right" id="sidebar-right">
+    <!-- AI 对话面板 -->
+    <div class="tool-section ai-section">
+      <div class="tool-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span>AI 对话驱动</span>
+        <span class="tool-badge" id="ai-badge">DeepSeek</span>
+      </div>
+      <div class="tool-body">
+        <div class="ai-key-row">
+          <input type="password" id="ai-api-key" class="ai-input" placeholder="粘贴 DeepSeek API Key" autocomplete="off" />
+          <button class="ai-key-toggle" id="ai-key-toggle" title="显示/隐藏 Key">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <div class="ai-model-row">
+          <select id="ai-model" class="ai-select">
+            <option value="deepseek-v4-flash" selected>deepseek-v4-flash (快)</option>
+            <option value="deepseek-v4-pro">deepseek-v4-pro (思考)</option>
+          </select>
+          <button class="ai-clear-btn" id="ai-clear" title="清空对话">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="ai-messages" id="ai-messages">
+        <div class="ai-empty">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" opacity="0.3"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <p>输入 API Key 后即可对话<br/>AI 会回复台词并生成动作</p>
+        </div>
+      </div>
+      <div class="ai-input-row">
+        <textarea id="ai-input" class="ai-input ai-input-text" placeholder="对角色说点什么…（如：挥挥手打招呼）" rows="1"></textarea>
+        <button class="ai-send-btn" id="ai-send" title="发送 (Enter)">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+      <div class="ai-status" id="ai-status"></div>
+    </div>
+
+    <div class="tool-section">
+      <div class="tool-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <span>VMD 反编译 / 编译</span>
+      </div>
+      <div class="tool-body">
+        <button class="tool-btn tool-btn-green" id="btn-decompile">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+          反编译并下载
+        </button>
         <div class="file-group">
-          <label class="file-btn compile-upload-btn">
-            📄 选择文本文件
+          <label class="tool-btn tool-btn-blue file-label">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            选择文本文件
             <input type="file" id="mpl-file-input" accept=".txt,.mpl" hidden />
           </label>
           <span class="file-name" id="mpl-file-name">未选择</span>
         </div>
-        <button class="editor-btn compile-btn" id="btn-compile">▶ 编译并播放</button>
+        <button class="tool-btn tool-btn-purple" id="btn-compile">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          编译并播放
+        </button>
+      </div>
+      <div class="tool-progress" id="editor-progress">
+        <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+        <span class="progress-text" id="progress-text"></span>
+      </div>
+      <div class="tool-status" id="editor-status">就绪</div>
+    </div>
+
+    <div class="tool-section">
+      <div class="tool-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+        <span>摄像头动作捕捉</span>
+        <span class="tool-badge" id="capture-badge">Holistic</span>
+      </div>
+      <div class="tool-body">
+        <div class="capture-controls">
+          <button class="tool-btn tool-btn-cyan" id="btn-camera">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+            启动捕捉
+          </button>
+          <button class="tool-btn tool-btn-outline" id="btn-calibrate" disabled>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+            校准
+          </button>
+        </div>
+        <div class="capture-controls">
+          <button class="tool-btn tool-btn-outline" id="btn-pose-image">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+            图片提取姿势
+          </button>
+          <button class="tool-btn tool-btn-outline" id="btn-pose-video">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+            视频提取动作
+          </button>
+        </div>
+        <input type="file" id="pose-image-input" accept="image/*" style="display:none" />
+        <input type="file" id="pose-video-input" accept="video/*" style="display:none" />
+        <div class="capture-modes">
+          <button class="mode-btn active" id="btn-mirror" data-mode="mirror">镜像模式</button>
+          <button class="mode-btn" id="btn-puppet" data-mode="puppet">木偶模式</button>
+        </div>
+        <div class="capture-toggles">
+          <label class="toggle-item">
+            <input type="checkbox" id="toggle-face" checked />
+            <span>面部表情</span>
+          </label>
+          <label class="toggle-item">
+            <input type="checkbox" id="toggle-hands" checked />
+            <span>手指追踪</span>
+          </label>
+        </div>
       </div>
     </div>
-    <div class="editor-progress" id="editor-progress">
-      <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
-      <span class="progress-text" id="progress-text"></span>
+
+    <div class="tool-section">
+      <div class="tool-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>
+        <span>录制 / 快照</span>
+      </div>
+      <div class="tool-body">
+        <div class="capture-controls">
+          <button class="tool-btn tool-btn-red" id="btn-record">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/></svg>
+            开始录制
+          </button>
+          <button class="tool-btn tool-btn-amber-outline" id="btn-snapshot">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            快照
+          </button>
+        </div>
+        <div class="record-status" id="record-status"></div>
+      </div>
     </div>
-    <div class="editor-status" id="editor-status">就绪</div>
-  </div>
+  </aside>
 
   <!-- 摄像头预览面板 -->
   <div class="pose-panel" id="pose-panel">
     <div class="pose-panel-header">
-      <span>摄像头预览</span>
-      <button class="pose-close" id="pose-close">×</button>
+      <span class="pose-title">
+        <span class="pose-live-dot"></span>
+        实时捕捉
+      </span>
+      <button class="pose-close" id="pose-close">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
     </div>
     <video id="pose-video" autoplay playsinline muted></video>
     <canvas id="pose-canvas" width="320" height="240"></canvas>
+    <div class="pose-stats" id="pose-stats">
+      <span>姿态: <b id="stat-pose">—</b></span>
+      <span>面部: <b id="stat-face">—</b></span>
+      <span>手部: <b id="stat-hands">—</b></span>
+    </div>
   </div>
 
   <!-- 底部控制栏 -->
   <div class="controls-bar">
-    <button class="control-btn" id="btn-play" title="播放/暂停">⏯️</button>
-    <button class="control-btn" id="btn-reset-camera" title="重置视角">📷</button>
+    <div class="control-group">
+      <button class="control-btn icon-btn" id="btn-play" title="播放/暂停">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" id="play-icon"><rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/></svg>
+      </button>
+      <button class="control-btn icon-btn" id="btn-reset-camera" title="重置视角">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+      </button>
+    </div>
+    <div class="control-divider"></div>
     <div class="speed-control">
-      <label>速度:</label>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
       <input type="range" id="speed-slider" min="0.1" max="3" step="0.1" value="1" />
       <span id="speed-label">1.0x</span>
     </div>
     <div class="control-divider"></div>
-    <button class="control-btn camera-btn" id="btn-camera" title="启动/停止摄像头动作捕捉">📷 摄像头</button>
-    <button class="control-btn calibrate-btn" id="btn-calibrate" title="校准初始姿态">🎯 校准</button>
-    <button class="control-btn mirror-btn" id="btn-mirror" title="切换镜像/木偶模式">🪞 镜像</button>
-    <button class="control-btn record-btn" id="btn-record" title="开始/停止录制">🔴 录制</button>
-    <button class="control-btn snapshot-btn" id="btn-snapshot" title="保存当前姿势为 VMD">📸 快照</button>
-    <span class="record-status" id="record-status"></span>
+    <div class="control-group">
+      <button class="control-btn icon-btn" id="btn-clear-scene" title="清空场景">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+      </button>
+    </div>
   </div>
 
+  <!-- 提示 -->
   <div class="footer-hint">
-    💡 鼠标左键旋转 | 右键平移 | 滚轮缩放 | 摄像头捕捉需 Chrome/Edge 浏览器
+    控制面板操作模型窗口 · 摄像头捕捉需联网下载模型
   </div>
 
-  <script src="/ammo.wasm.js"></script>
-  <script type="module" src="/main.js"></script>
+  <script type="module">
+    // 用动态 import 加载 main.js，这样能捕获 ES Module 的 import 错误
+    import('./main.js').then(() => {
+      console.log('[index.html] main.js 加载成功');
+      var ok = document.createElement('div');
+      ok.style.cssText = 'position:fixed;bottom:0;right:0;background:#4ade80;color:#000;padding:4px 8px;font-size:11px;z-index:99999;font-family:monospace';
+      ok.textContent = '✓ main.js OK';
+      setTimeout(function() { ok.remove(); }, 3000);
+      document.body.appendChild(ok);
+    }).catch((err) => {
+      console.error('[index.html] main.js 加载失败:', err);
+      var banner = document.createElement('div');
+      banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#f87171;color:#fff;padding:12px;font-size:13px;z-index:99999;font-family:monospace;white-space:pre-wrap;word-break:break-all';
+      banner.textContent = '❌ main.js 加载失败: ' + (err && err.message ? err.message : String(err));
+      document.body.appendChild(banner);
+    });
+  </script>
 </body>
 </html>

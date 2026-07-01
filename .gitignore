@@ -34,6 +34,14 @@ Thumbs.db
 unity-project/
 vrm-tool/
 
+# Third-party plug-in projects (not part of core)
+plug/MiKaPo-main/
+plug/PoPo-main/
+plug/*.zip
+
+# Temp reference files
+.tmp_*
+
 # Docs
 *.md
 !package.json

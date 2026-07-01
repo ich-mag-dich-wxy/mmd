@@ -1019,3 +1019,59 @@ export function downloadVMD(vmdData, fileName) {
   a.click();
   URL.revokeObjectURL(url);
 }
+
+// ═══════════════════════════════════════════════════════════
+//  BoneState[] → 单帧 VMD 二进制（左手系，照搬 PoPo VPD 思路）
+//
+//  solver 输出 Babylon 左手系四元数，与 VMD 原始数据坐标系一致。
+//  直接写入 VMD buffer（不做坐标转换），交给 MMDLoader.loadAnimation
+//  加载时由 parseVmd(buffer, true) 统一做 leftToRight 转换。
+//  这样动捕路径完全复用 VMD 播放路径（已验证正常），不手动转换。
+// ═══════════════════════════════════════════════════════════
+export function boneStatesToVMDBuffer(boneStates, modelName = 'MotionCapture') {
+  const boneCount = boneStates.length;
+  // VMD 布局: header(50) + motionCount(4) + motions + morphCount(4) + morphs + cameraCount(4) + cameras
+  // parseVmd 依次读 motionCount/morphs/cameras，缺 cameraCount 会越界。
+  const dataSize = VMD_HEADER_SIZE + 4 + boneCount * BONE_FRAME_SIZE + 4 + 4;
+  const buffer = new ArrayBuffer(dataSize);
+  const view = new DataView(buffer);
+
+  // 头部
+  encodeShiftJISInto('Vocaloid Motion Data 0002', view, 0, 30);
+  encodeShiftJISInto(modelName, view, 30, 20);
+
+  // 骨骼帧数
+  let offset = VMD_HEADER_SIZE;
+  view.setUint32(offset, boneCount, true);
+  offset += 4;
+
+  // 每个骨骼一帧（frameNum=0），位置=0，旋转=solver 输出（左手系原值）
+  // 插值字节默认 20（线性）
+  for (let i = 0; i < boneCount; i++) {
+    const bs = boneStates[i];
+    const r = bs.rotation;
+    encodeShiftJISInto(bs.name, view, offset, BONE_NAME_LEN);
+    offset += BONE_NAME_LEN;
+    view.setUint32(offset, 0, true); // frameNum = 0
+    offset += 4;
+    view.setFloat32(offset, 0, true); // px
+    view.setFloat32(offset + 4, 0, true); // py
+    view.setFloat32(offset + 8, 0, true); // pz
+    offset += 12;
+    view.setFloat32(offset, r.x, true); // qx（左手系原值）
+    view.setFloat32(offset + 4, r.y, true); // qy
+    view.setFloat32(offset + 8, r.z, true); // qz
+    view.setFloat32(offset + 12, r.w, true); // qw
+    offset += 16;
+    for (let b = 0; b < 64; b++) view.setUint8(offset + b, 20); // 线性插值
+    offset += 64;
+  }
+
+  // morphCount = 0
+  view.setUint32(offset, 0, true);
+  offset += 4;
+  // cameraCount = 0
+  view.setUint32(offset, 0, true);
+
+  return buffer;
+}

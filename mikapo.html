@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MiKaPo Clone — reze-engine + plug 动捕</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #06070d; color: #fff; font-family: system-ui, sans-serif; }
+    /* reze-engine 需要一个全屏 canvas 作为渲染目标 */
+    #scene-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
+    #ui-overlay {
+      position: absolute; top: 12px; left: 12px; z-index: 10;
+      background: rgba(10, 12, 20, 0.7); backdrop-filter: blur(8px);
+      border: 1px solid rgba(255,255,255,0.1); border-radius: 10px;
+      padding: 10px; width: 320px; max-width: calc(100vw - 24px);
+    }
+    .row { display: flex; gap: 6px; margin-bottom: 6px; }
+    button {
+      flex: 1; padding: 8px 10px; font-size: 12px; cursor: pointer;
+      background: rgba(255,255,255,0.08); color: #fff; border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 6px; transition: background 0.15s;
+    }
+    button:hover:not(:disabled) { background: rgba(255,255,255,0.16); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.primary { background: #2563eb; border-color: #3b82f6; }
+    button.primary:hover:not(:disabled) { background: #1d4ed8; }
+    button.danger { background: #dc2626; border-color: #ef4444; }
+    button.danger:hover:not(:disabled) { background: #b91c1c; }
+    #media-wrap {
+      width: 100%; aspect-ratio: 4/3; background: #000; border-radius: 6px;
+      overflow: hidden; margin-top: 6px; position: relative;
+    }
+    #pose-video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); display: block; }
+    #pose-image { width: 100%; height: 100%; object-fit: contain; display: none; }
+    #status {
+      font-size: 11px; color: rgba(255,255,255,0.7); margin-top: 6px;
+      font-family: 'JetBrains Mono', monospace; min-height: 16px;
+    }
+    .hint { font-size: 10px; color: rgba(255,255,255,0.4); margin-top: 4px; }
+    #fps { position: absolute; top: 12px; right: 12px; font-family: monospace; font-size: 11px; color: rgba(255,255,255,0.5); z-index: 10; }
+  </style>
+</head>
+<body>
+  <!-- reze-engine 渲染目标 -->
+  <canvas id="scene-canvas"></canvas>
+
+  <div id="ui-overlay">
+    <div class="row">
+      <button class="primary" id="btn-camera" disabled>启动摄像头</button>
+      <button id="btn-model">加载 PMX 文件夹</button>
+    </div>
+    <div class="row">
+      <button id="btn-image" disabled>图片提取</button>
+      <button id="btn-video" disabled>视频提取</button>
+      <button class="primary" id="btn-record">录制 VMD</button>
+    </div>
+    <div id="media-wrap">
+      <video id="pose-video" autoplay playsinline muted></video>
+      <img id="pose-image" alt="" />
+    </div>
+    <div id="status">初始化中...</div>
+    <div class="hint">默认加载 刻晴.pmx；可点"加载 PMX 文件夹"换模型</div>
+  </div>
+
+  <div id="fps">— FPS</div>
+
+  <input type="file" id="model-folder-input" webkitdirectory multiple style="display:none" />
+  <input type="file" id="image-input" accept="image/*" style="display:none" />
+  <input type="file" id="video-input" accept="video/*" style="display:none" />
+
+  <script type="module" src="./mikapo.js"></script>
+</body>
+</html>

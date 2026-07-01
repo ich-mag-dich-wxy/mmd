@@ -87,10 +87,12 @@ function buildBoneMap(bones) {
         if (found >= 0) break;
       }
     }
-    // 5. 包含匹配
+    // 5. 包含匹配（排除 IK 骨骼：避免「左足」误匹配到「左足ＩＫ」，
+    //    IK 骨骼旋转会驱动 IK 链把双腿拉到一起 → 双腿并拢一起动）
     if (found < 0) {
       for (let i = 0; i < modelNames.length; i++) {
         const nl = modelNamesLower[i];
+        if (nl.includes('ＩＫ') || nl.includes('ik') || nl.includes('IK')) continue;
         if (nl.includes(stdName.toLowerCase()) || stdName.toLowerCase().includes(nl)) {
           found = i; break;
         }
