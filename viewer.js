@@ -18,7 +18,8 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { MMDLoader } from 'three/addons/loaders/MMDLoader.js';
 import { MMDAnimationHelper } from 'three/addons/animation/MMDAnimationHelper.js';
-import { compileMPLToVMD, isMPLScript } from './src/core/mplCompiler.js';
+import { compileMPLToVMD, isMPLScript, preloadVMDForPatch, setLastMplText } from './src/core/mplCompiler.js';
+import { isKFM, kfmToMPL } from './src/core/kfmConverter.js';
 import { textToVMD } from './src/core/vmdDecompiler.js';
 import { resetCalibration, setMirrorMode, buildPoseBoneMap } from './src/core/poseCapture.js';
 import { Solver as PoPoSolver, SOLVER_REST_BONES } from './src/core/poseCapture/solver.js';
@@ -283,7 +284,12 @@ async function loadModelFromPath(payload) {
       vmdBuffer: null,
       pmxUrl: pmxBlobUrl,
       createdUrls,
+      // 自动错开位置：每个模型在 X 轴偏移，避免重叠
+      // 偏移量基于已加载数量，间隔约 30 单位（足够分开两个角色）
+      offset: state.loadedModels.length * 30,
     };
+    mesh.position.x = loaded.offset;
+    mesh.updateMatrixWorld(true);
     state.loadedModels.push(loaded);
     state.activeModelId = loaded.id;
 
@@ -421,20 +427,63 @@ function forceResetModel(model) {
 }
 
 // 编译 MPL/TXT 并播放
-// payload: { text, name }
+// payload: { text, name, pairedVmdPath? }
 async function compileMpl(payload) {
   const model = getActiveModel();
-  if (!model) { setStatus('请先加载模型'); return; }
+  if (!model) {
+    setStatus('请先加载模型');
+    // 必须回传错误，否则控制面板 AI 消息会卡在"正在生成动作…"
+    sendStateToControl({ type: 'compile-error', error: '未加载模型' });
+    return;
+  }
 
   state.pendingMplText = payload.text;
   state.pendingMplName = payload.name;
 
   let vmdData;
   try {
-    if (isMPLScript(payload.text)) {
-      vmdData = await compileMPLToVMD(payload.text);
+    // 优先检测 KFM 格式（AI 生成的紧凑关键帧格式）
+    let mplText = payload.text;
+    if (isKFM(payload.text)) {
+      console.log('[viewer] 检测到 KFM 格式，转换为 MPL...');
+      sendStateToControl({ type: 'compile-log', msg: '检测到 KFM 格式，转换为 MPL...' });
+      mplText = kfmToMPL(payload.text);
+      console.log(`[viewer] KFM → MPL: ${payload.text.length} → ${mplText.length} 字符`);
+      sendStateToControl({ type: 'compile-log', msg: `KFM → MPL: ${payload.text.length} → ${mplText.length} 字符` });
+    }
+
+    const isMPL = isMPLScript(mplText);
+    console.log('[viewer] isMPLScript判定:', isMPL, '文本前100字:', mplText.slice(0, 100));
+    sendStateToControl({ type: 'compile-log', msg: `isMPLScript=${isMPL}, 走 ${isMPL ? 'compileMPLToVMD' : 'textToVMD'} 分支` });
+    if (isMPL) {
+      // 如果提供了配对的原始 VMD 文件，预填充四元数和 IK 骨骼缓存
+      // 这样即使用户加载已保存的 MPL 文件，patchVMDQuaternions 和 patchVMDLostBones 也能生效
+      if (payload.pairedVmdPath) {
+        try {
+          const vmdBuffer = await window.electronAPI.readFileArrayBuffer(payload.pairedVmdPath);
+          await preloadVMDForPatch(new Uint8Array(vmdBuffer));
+          setLastMplText(payload.text);
+          sendStateToControl({ type: 'compile-log', msg: `已从配对 VMD 预填充缓存: ${payload.pairedVmdPath.split(/[\\/]/).pop()}` });
+        } catch (e) {
+          console.warn('[viewer] 预填充 VMD 缓存失败:', e);
+          sendStateToControl({ type: 'compile-log', msg: `预填充 VMD 缓存失败: ${e.message}` });
+        }
+      }
+      vmdData = await compileMPLToVMD(mplText);
+      // 验证 bezier 是否真的被修复：检查第一帧的前 16 字节
+      const vview = new DataView(vmdData.buffer);
+      const vcount = vview.getUint32(50, true);
+      if (vcount > 0) {
+        const b = vmdData.slice(101, 117);
+        const x1 = b[0], x2 = b[4], y1 = b[8], y2 = b[12];
+        const isLinear = (x1 === y1) && (x2 === y2);
+        sendStateToControl({ type: 'compile-log', msg: `compileMPLToVMD: VMD=${vmdData.length}字节, 骨骼帧=${vcount}, bezier首帧=[${[...b].join(',')}], P2=(${x1},${y1})P3=(${x2},${y2}), 线性=${isLinear}` });
+      } else {
+        sendStateToControl({ type: 'compile-log', msg: `compileMPLToVMD: VMD=${vmdData.length}字节, 骨骼帧=0` });
+      }
     } else {
       vmdData = await textToVMD(payload.text);
+      sendStateToControl({ type: 'compile-log', msg: `textToVMD 完成, VMD=${vmdData.length}字节 (未应用bezier修复!)` });
     }
   } catch (err) {
     setStatus(`编译失败: ${err.message}`);

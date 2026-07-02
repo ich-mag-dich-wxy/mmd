@@ -512,6 +512,29 @@ input, select {
   color: var(--text-secondary);
 }
 
+.unload-btn {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s;
+  padding: 0;
+  margin-left: 6px;
+}
+
+.unload-btn:hover {
+  background: rgba(255, 77, 77, 0.15);
+  border-color: rgba(255, 77, 77, 0.5);
+  color: #ff5555;
+}
+
 .resource-info {
   flex: 1;
   min-width: 0;
@@ -720,6 +743,27 @@ input, select {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 90px;
+}
+
+.convert-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.convert-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  font-family: var(--font-mono);
+}
+
+.convert-divider {
+  height: 1px;
+  background: var(--border-color);
+  margin: 4px 0;
 }
 
 .capture-controls {

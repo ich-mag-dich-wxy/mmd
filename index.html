@@ -122,12 +122,12 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
           <span>选择动作文件夹</span>
         </button>
-        <p class="folder-hint" id="motions-folder-hint">支持 VMD 动作 + 编译 TXT</p>
+        <p class="folder-hint" id="motions-folder-hint">支持 VMD 动作 + MPL 脚本</p>
       </div>
       <div class="motion-filter" id="motion-filter">
         <button class="filter-btn active" data-filter="all">全部</button>
         <button class="filter-btn" data-filter="vmd">VMD</button>
-        <button class="filter-btn" data-filter="txt">TXT</button>
+        <button class="filter-btn" data-filter="mpl">MPL</button>
       </div>
       <div class="resource-list" id="motions-list">
         <div class="empty-state">
@@ -185,22 +185,35 @@
         <span>VMD 反编译 / 编译</span>
       </div>
       <div class="tool-body">
-        <button class="tool-btn tool-btn-green" id="btn-decompile">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-          反编译并下载
-        </button>
-        <div class="file-group">
-          <label class="tool-btn tool-btn-blue file-label">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-            选择文本文件
-            <input type="file" id="mpl-file-input" accept=".txt,.mpl" hidden />
-          </label>
-          <span class="file-name" id="mpl-file-name">未选择</span>
+        <div class="convert-block">
+          <div class="convert-label">MPL → VMD</div>
+          <div class="file-group">
+            <button class="tool-btn tool-btn-blue file-label" id="btn-pick-mpl">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+              选择 MPL 文件
+            </button>
+            <span class="file-name" id="mpl-file-name">未选择</span>
+          </div>
+          <button class="tool-btn tool-btn-purple" id="btn-compile-download" disabled>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            编译为 VMD 并下载
+          </button>
         </div>
-        <button class="tool-btn tool-btn-purple" id="btn-compile">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-          编译并播放
-        </button>
+        <div class="convert-divider"></div>
+        <div class="convert-block">
+          <div class="convert-label">VMD → MPL（语义，有损）</div>
+          <div class="file-group">
+            <button class="tool-btn tool-btn-green file-label" id="btn-pick-vmd">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+              选择 VMD 文件
+            </button>
+            <span class="file-name" id="vmd-file-name">未选择</span>
+          </div>
+          <button class="tool-btn tool-btn-green" id="btn-decompile-download" disabled>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+            反编译为 MPL 并下载
+          </button>
+        </div>
       </div>
       <div class="tool-progress" id="editor-progress">
         <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>

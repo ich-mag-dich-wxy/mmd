@@ -311,13 +311,13 @@ ipcMain.handle('dialog:pick-motions-folder', async () => {
   return { folderPath, files };
 });
 
-// 选择单个文本/mpl 文件
+// 选择单个 MPL 文件
 ipcMain.handle('dialog:pick-text-file', async () => {
   const result = await dialog.showOpenDialog(controlWindow, {
     properties: ['openFile'],
-    title: '选择文本文件',
+    title: '选择 MPL 文件',
     filters: [
-      { name: '文本', extensions: ['txt', 'mpl'] },
+      { name: 'MPL', extensions: ['mpl'] },
       { name: '所有文件', extensions: ['*'] },
     ],
   });
@@ -328,6 +328,26 @@ ipcMain.handle('dialog:pick-text-file', async () => {
   const text = buffer.toString('utf-8');
   const name = path.basename(filePath);
   return { filePath, name, text };
+});
+
+// 选择 VMD 二进制文件（用于独立反编译）
+ipcMain.handle('dialog:pick-vmd-file', async () => {
+  const result = await dialog.showOpenDialog(controlWindow, {
+    properties: ['openFile'],
+    title: '选择 VMD 文件',
+    filters: [
+      { name: 'VMD 动作', extensions: ['vmd'] },
+      { name: '所有文件', extensions: ['*'] },
+    ],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  const filePath = result.filePaths[0];
+  const buffer = fs.readFileSync(filePath);
+  return {
+    filePath,
+    name: path.basename(filePath),
+    arrayBuffer: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
+  };
 });
 
 // 选择图片/视频文件（动捕输入）
@@ -388,25 +408,53 @@ ipcMain.handle('file:read-arraybuffer', async (_event, filePath) => {
   return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
 });
 
-// 保存文件（VMD 导出/录制/快照）
-ipcMain.handle('file:save', async (_event, { defaultName, data, filters }) => {
-  const result = await dialog.showSaveDialog(controlWindow, {
-    defaultPath: defaultName,
-    filters: filters || [{ name: '所有文件', extensions: ['*'] }],
-  });
-  if (result.canceled) return null;
+// 保存文件
+// 用户可自由选择保存位置，若所选位置无写入权限则自动回退到项目目录
+ipcMain.handle('file:save', async (_event, { defaultName, data }) => {
+  const path = require('path');
+  const fs = require('fs');
+  const { shell } = require('electron');
+
+  // 解码数据
+  let buffer;
   try {
-    // data 可能是 base64 字符串或 Uint8Array
     if (typeof data === 'string') {
-      fs.writeFileSync(result.filePath, Buffer.from(data, 'base64'));
+      buffer = Buffer.from(data, 'base64');
     } else if (data && data.type === 'base64') {
-      fs.writeFileSync(result.filePath, Buffer.from(data.data, 'base64'));
+      buffer = Buffer.from(data.data, 'base64');
+    } else if (data instanceof Uint8Array || data instanceof ArrayBuffer) {
+      buffer = Buffer.from(data);
     } else {
-      fs.writeFileSync(result.filePath, data);
+      buffer = Buffer.from(String(data));
     }
+  } catch (e) {
+    return { error: `数据解码失败: ${e.message}` };
+  }
+
+  const name = defaultName || 'output';
+
+  // 项目目录 downloads（确保存在且可写）
+  const projectDir = path.join(__dirname, '..', 'downloads');
+  try { fs.mkdirSync(projectDir, { recursive: true }); } catch (_) {}
+
+  // 弹原生保存对话框，默认定位到项目目录 downloads
+  const result = await dialog.showSaveDialog(controlWindow, {
+    title: '保存文件',
+    defaultPath: path.join(projectDir, name),
+  });
+  if (result.canceled) return { canceled: true };
+
+  // 尝试写入用户所选路径
+  try {
+    fs.writeFileSync(result.filePath, buffer);
+    shell.showItemInFolder(result.filePath);
     return { filePath: result.filePath };
-  } catch (err) {
-    return { error: err.message };
+  } catch (_) {
+    // 所选路径无权限 → 回退到项目目录 downloads
+    const fallback = path.join(projectDir, name);
+    fs.writeFileSync(fallback, buffer);
+    shell.openPath(projectDir);
+    return { filePath: fallback, note: '所选位置无写入权限，已自动保存到项目目录' };
   }
 });
 

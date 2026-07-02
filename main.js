@@ -13,8 +13,7 @@
 //    - 动捕 landmarks 在这里采集，通过 IPC 实时传给 viewer
 // ═══════════════════════════════════════════════════════════
 
-import { vmdToText, downloadVMD } from './src/core/vmdDecompiler.js';
-import { compileMPLToVMD, isMPLScript } from './src/core/mplCompiler.js';
+import { compileMPLToVMD, isMPLScript, reverseCompileVMD, preloadVMDForPatch, setLastMplText } from './src/core/mplCompiler.js';
 import { drawPoseCanvas, resetCalibration, setMirrorMode, getMirrorMode } from './src/core/poseCapture.js';
 import { PoseCaptureSystem } from './src/core/poseCaptureSystem.js';
 import { VMDRecorder, saveRecording } from './src/core/vmdRecorder.js';
@@ -39,10 +38,10 @@ const state = {
   poseCapture: null,
   poseActive: false,
   poseLandmarks: null,
-  // 编译/反编译
+  // 编译/反编译（独立流程，不依赖模型或动作应用）
   mplFileText: null,
   mplFileName: '',
-  vmdArrayBuffer: null,
+  vmdFileBytes: null,
   vmdFileName: '',
   // 录制
   recorder: null,
@@ -137,6 +136,8 @@ if (api && api.onViewerState) {
     } else if (viewerState.type === 'compile-error') {
       setStatus(`编译失败: ${viewerState.error}`);
       if (_lastAIMsgEl) setAIMotion(_lastAIMsgEl, '✗ 动作编译失败: ' + viewerState.error, true);
+    } else if (viewerState.type === 'compile-log') {
+      console.log('[viewer→控制台]', viewerState.msg);
     }
   });
 }
@@ -207,11 +208,11 @@ async function pickMotionsFolder() {
 
   const motionFiles = files.filter(f => {
     const n = f.name.toLowerCase();
-    return n.endsWith('.vmd') || n.endsWith('.txt') || n.endsWith('.mpl');
+    return n.endsWith('.vmd') || n.endsWith('.mpl');
   });
 
   if (motionFiles.length === 0) {
-    setStatus('文件夹中未找到 VMD/TXT 文件');
+    setStatus('文件夹中未找到 VMD/MPL 文件');
     return;
   }
 
@@ -219,8 +220,8 @@ async function pickMotionsFolder() {
 
   for (const f of motionFiles) {
     const n = f.name.toLowerCase();
-    const type = n.endsWith('.vmd') ? 'vmd' : 'txt';
-    const name = f.name.replace(/\.(vmd|txt|mpl)$/i, '');
+    const type = n.endsWith('.vmd') ? 'vmd' : 'mpl';
+    const name = f.name.replace(/\.(vmd|mpl)$/i, '');
     state.motionLibrary.push({
       id: nextMotionId(),
       name,
@@ -228,7 +229,7 @@ async function pickMotionsFolder() {
       path: f.fullPath,
       folderName,
       size: f.size,
-      text: null,  // txt 文件内容按需读取
+      text: null,  // MPL 文件内容按需读取
     });
   }
 
@@ -262,32 +263,32 @@ async function applyMotion(motionEntry) {
   try {
     if (motionEntry.type === 'vmd') {
       showLoading(`加载 VMD: ${motionEntry.name}...`);
-      // 读取 VMD 文件内容（用于反编译），同时传路径给 viewer
-      if (api && api.readFileArrayBuffer) {
-        state.vmdArrayBuffer = await api.readFileArrayBuffer(motionEntry.path);
-        state.vmdFileName = motionEntry.name + '.vmd';
-      }
       sendToViewer('viewer:play-vmd', {
         vmdPath: motionEntry.path,
         name: motionEntry.name,
       });
       hideLoading();
-    } else if (motionEntry.type === 'txt') {
-      showLoading(`编译文本: ${motionEntry.name}...`);
+    } else if (motionEntry.type === 'mpl') {
+      showLoading(`编译 MPL: ${motionEntry.name}...`);
       // 读取文本内容
       let text = motionEntry.text;
       if (!text && api && api.readFileArrayBuffer) {
-        // 读取文本文件
         const buffer = await api.readFileArrayBuffer(motionEntry.path);
         text = new TextDecoder('utf-8').decode(buffer);
         motionEntry.text = text;
       }
-      state.mplFileText = text;
-      state.mplFileName = motionEntry.name;
-      $('#mpl-file-name').textContent = `✓ ${motionEntry.name}`;
+      // 查找同文件夹下同名的 VMD 文件，用于预填充四元数/IK骨骼缓存
+      // （解决用户加载已保存的 MPL 时，_lastOrigQuats/_lastLostBoneFrames 为空的问题）
+      const pairedVmd = state.motionLibrary.find(m =>
+        m !== motionEntry &&
+        m.type === 'vmd' &&
+        m.name === motionEntry.name &&
+        m.folderName === motionEntry.folderName
+      );
       sendToViewer('viewer:compile-mpl', {
         text,
         name: motionEntry.name,
+        pairedVmdPath: pairedVmd ? pairedVmd.path : null,
       });
       hideLoading();
     }
@@ -380,24 +381,117 @@ async function stopRecording() {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  反编译
+//  反编译 / 编译（独立流程，不依赖模型或动作应用）
 // ═══════════════════════════════════════════════════════════
 
-async function decompileVMD() {
-  if (!state.vmdArrayBuffer) { setStatus('请先加载 VMD 动作'); return; }
+// 选择 MPL 文件（独立流程，不应用到模型）
+async function pickMPLFile() {
+  if (!api || !api.pickTextFile) { setStatus('当前环境不支持文件选择'); return; }
+  try {
+    const result = await api.pickTextFile();
+    if (!result) return;
+    state.mplFileText = result.text;
+    state.mplFileName = result.name.replace(/\.mpl$/i, '');
+    $('#mpl-file-name').textContent = `✓ ${result.name}`;
+    $('#btn-compile-download').disabled = false;
+    setStatus(`已加载 MPL: ${result.name}`);
+  } catch (err) {
+    setStatus(`加载失败: ${err.message}`);
+  }
+}
+
+// 选择 VMD 文件（独立流程，不应用到模型）
+async function pickVMDFile() {
+  if (!api || !api.pickVMDFile) { setStatus('当前环境不支持文件选择'); return; }
+  try {
+    const result = await api.pickVMDFile();
+    if (!result) return;
+    state.vmdFileBytes = new Uint8Array(result.arrayBuffer);
+    state.vmdFileName = result.name.replace(/\.vmd$/i, '');
+    $('#vmd-file-name').textContent = `✓ ${result.name}`;
+    $('#btn-decompile-download').disabled = false;
+    setStatus(`已加载 VMD: ${result.name}`);
+  } catch (err) {
+    setStatus(`加载失败: ${err.message}`);
+  }
+}
+
+// Uint8Array → base64 字符串（IPC 传递最稳，避免 WASM 内存视图序列化问题）
+function uint8ToBase64(bytes) {
+  let binary = '';
+  const len = bytes.length;
+  for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+// 统一保存：弹出原生保存对话框 → 用户选择路径 → 写入文件
+// 若所选路径无权限，自动回退到项目目录
+async function saveOrDownload(data, defaultName, filters, kind) {
+  if (api && api.saveFile) {
+    const result = await api.saveFile({ defaultName, data });
+    if (result && result.canceled) { setStatus('已取消保存'); return; }
+    if (result && result.error) throw new Error(result.error);
+    if (result && result.filePath) {
+      setStatus(result.note
+        ? `已保存: ${result.filePath} (${result.note})`
+        : `已保存: ${result.filePath}`);
+      return;
+    }
+  }
+  // 浏览器回退
+  const blob = new Blob([data], { type: kind === 'mpl' ? 'text/plain;charset=utf-8' : 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = defaultName;
+  a.click();
+  URL.revokeObjectURL(url);
+  setStatus(`已下载: ${defaultName}`);
+}
+
+// 编译 MPL → VMD 并下载
+async function compileMPLDownload() {
+  if (!state.mplFileText) { setStatus('请先选择 MPL 文件'); return; }
   try {
     startProgress();
-    setStatus('反编译中...');
-    const text = await vmdToText(state.vmdArrayBuffer, showProgress);
+    setStatus('编译 MPL → VMD 中...');
+    // 如果同时加载了 VMD 文件，预填充四元数/IK骨骼缓存
+    // 这样 patchVMDQuaternions 和 patchVMDLostBones 才能生效
+    if (state.vmdFileBytes) {
+      await preloadVMDForPatch(new Uint8Array(state.vmdFileBytes.buffer));
+      setLastMplText(state.mplFileText);
+      setStatus('已从 VMD 预填充缓存，编译中...');
+    }
+    const bytes = await compileMPLToVMD(state.mplFileText);
     endProgress();
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = state.vmdFileName.replace(/\.vmd$/i, '.txt');
-    a.click();
-    URL.revokeObjectURL(url);
-    setStatus(`已下载: ${state.vmdFileName.replace(/\.vmd$/i, '.txt')}`);
+    const base64 = uint8ToBase64(bytes);
+    await saveOrDownload(
+      base64,
+      `${state.mplFileName || 'output'}.vmd`,
+      [{ name: 'VMD 动作', extensions: ['vmd'] }],
+      'vmd',
+    );
+  } catch (err) {
+    endProgress();
+    setStatus(`编译失败: ${err.message}`);
+  }
+}
+
+// 反编译 VMD → MPL 代码（语义化 DSL，供 AI 学习/生成；有损：角度四舍五入至 5°，无 bezier 曲线）
+async function decompileVMDDownload() {
+  if (!state.vmdFileBytes) { setStatus('请先选择 VMD 文件'); return; }
+  try {
+    startProgress();
+    setStatus('反编译 VMD → MPL 中...');
+    const mplText = await reverseCompileVMD(new Uint8Array(state.vmdFileBytes.buffer));
+    endProgress();
+    const base64 = uint8ToBase64(new TextEncoder().encode(mplText));
+    await saveOrDownload(
+      base64,
+      `${state.vmdFileName || 'output'}.mpl`,
+      [{ name: 'MPL 脚本', extensions: ['mpl'] }],
+      'mpl',
+    );
   } catch (err) {
     endProgress();
     setStatus(`反编译失败: ${err.message}`);
@@ -438,6 +532,7 @@ function updateModelListUI() {
             ${isActive ? '<span class="resource-tag">已加载</span>' : ''}
           </div>
         </div>
+        ${isActive ? '<button class="unload-btn" data-unload-id="' + m.id + '" title="卸载此模型"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>' : ''}
       </div>`;
   }).join('');
 }
@@ -510,6 +605,20 @@ function bindEvents() {
 
   // 资源列表点击
   document.addEventListener('click', (e) => {
+    // 卸载按钮（优先处理，避免触发 resource-item 加载）
+    const unloadBtn = e.target.closest('.unload-btn');
+    if (unloadBtn) {
+      e.stopPropagation();
+      const unloadId = unloadBtn.dataset.unloadId;
+      if (unloadId) {
+        sendToViewer('viewer:unload-model', { id: unloadId });
+        // 立即更新 UI 状态（viewer 回传 model-unloaded 后会再更新一次）
+        state.activeModelId = null;
+        updateModelListUI();
+        setStatus('已卸载模型');
+      }
+      return;
+    }
     const item = e.target.closest('.resource-item');
     if (!item) return;
     const id = item.dataset.id;
@@ -590,26 +699,11 @@ function bindEvents() {
     // TODO: 在控制面板处理视频提取动作
   });
 
-  // 反编译/编译
-  $('#btn-decompile').addEventListener('click', decompileVMD);
-
-  $('#mpl-file-input').addEventListener('change', async (e) => {
-    // Electron 模式下改用 dialog，这个 input 可能不会触发
-    const file = e.target.files[0];
-    if (!file) return;
-    state.mplFileText = await file.text();
-    state.mplFileName = file.name.replace(/\.(txt|mpl)$/i, '');
-    $('#mpl-file-name').textContent = `✓ ${file.name}`;
-    setStatus(`已加载文本: ${file.name}`);
-  });
-
-  $('#btn-compile').addEventListener('click', async () => {
-    if (!state.mplFileText) { setStatus('请先选择文本文件'); return; }
-    sendToViewer('viewer:compile-mpl', {
-      text: state.mplFileText,
-      name: state.mplFileName,
-    });
-  });
+  // 反编译/编译（独立流程）
+  $('#btn-pick-mpl').addEventListener('click', pickMPLFile);
+  $('#btn-pick-vmd').addEventListener('click', pickVMDFile);
+  $('#btn-compile-download').addEventListener('click', compileMPLDownload);
+  $('#btn-decompile-download').addEventListener('click', decompileVMDDownload);
 
   // 录制
   $('#btn-record').addEventListener('click', () => {
@@ -779,12 +873,17 @@ async function sendAIMessage() {
     }
     setAIMotion(aiMsgEl, '正在生成动作…');
     setAIStatus('已回复，正在播放动作…', 'ok');
+    // 打印 AI 生成的 MPL 到控制台，便于诊断
+    console.log('[AI] 生成 MPL:', mpl.length, '字符\n', mpl.slice(0, 500));
     sendToViewer('viewer:compile-mpl', {
       text: mpl,
       name: 'AI生成动作',
     });
   } else {
-    setAIStatus('已回复', 'ok');
+    // MPL 为空：明确提示，不要静默放过
+    setAIMotion(aiMsgEl, '⚠ AI 未生成动作脚本（mpl 为空）', true);
+    setAIStatus('已回复，但未生成动作', 'err');
+    console.warn('[AI] 未生成 MPL，原始回复:', result.content.slice(0, 300));
   }
 }
 

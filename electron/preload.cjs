@@ -27,6 +27,7 @@ const controlAPI = {
   pickModelsFolder: () => ipcRenderer.invoke('dialog:pick-models-folder'),
   pickMotionsFolder: () => ipcRenderer.invoke('dialog:pick-motions-folder'),
   pickTextFile: () => ipcRenderer.invoke('dialog:pick-text-file'),
+  pickVMDFile: () => ipcRenderer.invoke('dialog:pick-vmd-file'),
   pickMediaFile: (filters) => ipcRenderer.invoke('dialog:pick-media-file', filters),
 
   // 文件读写
